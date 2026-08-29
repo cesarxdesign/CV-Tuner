@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TCV</title>
+<style>
+  /* ===========================================================
+     THEME. Dark is the base; the light block below overrides it
+     when macOS is in light mode. Nothing is hardcoded past this
+     point: every colour in the sheet is a token, so a new rule
+     inherits the theme for free. Add a colour here or nowhere.
+     =========================================================== */
+  :root{
+    color-scheme: dark light;
+    --bg:#0e0f11; --panel:#17191c; --panel2:#25282c; --hover:#1b1e22;
+    --line:#2a2e33; --line2:#3a4048;
+    --fg:#e8eaed; --dim:#9aa3ad; --dimmer:#6b747e;
+    --accent:#7db3ff; --onaccent:#0b1220;
+    --good:#6fce9f; --goodline:#2f5c44;
+    --warn:#ffb454; --warnline:#5a4526;
+    --bad:#ff8080;
+    --infobg:#152029;  --infoline:#23394a;  --infofg:#bcd8f0;
+    --errbg:#2b1618;   --errline:#5a2b2e;   --errfg:#ffc4c4;
+    --veil:rgba(14,15,17,.45);
+    --shadow:none;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#f5f6f8; --panel:#ffffff; --panel2:#eceef1; --hover:#f6f7f9;
+      --line:#e0e3e7; --line2:#c8ced6;
+      --fg:#14171b; --dim:#59616c; --dimmer:#848c97;
+      --accent:#2563eb; --onaccent:#ffffff;
+      --good:#0f7a45; --goodline:#a8d8bf;
+      --warn:#96590a; --warnline:#e7cb9a;
+      --bad:#c0272d;
+      --infobg:#eef4fc;  --infoline:#cbdff5;  --infofg:#1b4570;
+      --errbg:#fdeef0;   --errline:#f2c7cb;   --errfg:#8d2229;
+      --veil:rgba(20,23,27,.10);
+      --shadow:0 1px 2px rgba(18,20,23,.05);
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg); height:100vh; display:flex;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",Helvetica,Arial,sans-serif;
+  }
+  .left{width:47%; min-width:400px; display:flex; flex-direction:column; border-right:1px solid var(--line)}
+  .right{flex:1; display:flex; flex-direction:column; background:var(--panel2)}
+  header{padding:16px 20px 12px; border-bottom:1px solid var(--line)}
+  h1{font-size:14px; margin:0; letter-spacing:2.4px; text-transform:uppercase; color:var(--dim); font-weight:600}
+  .status{font-size:11.5px; color:var(--dimmer); margin-top:5px}
+  .status b{color:var(--good); font-weight:600}
+  .status b.bad{color:var(--bad)}
+  .pane{flex:1; overflow-y:auto; padding:16px 20px}
+  label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:1.1px;
+        color:var(--dimmer); margin:0 0 6px; font-weight:600}
+  textarea,input,select{
+    width:100%; background:var(--panel); border:1px solid var(--line2); color:var(--fg);
+    border-radius:7px; padding:10px 12px; font-size:13px; font-family:inherit; outline:none;
+  }
+  textarea{resize:vertical; line-height:1.5}
+  textarea:focus,input:focus{border-color:var(--accent)}
+  textarea#jd{min-height:230px}
+  .row{display:flex; gap:10px; align-items:flex-end; margin-top:14px}
+  .row > div{flex:1}
+  .or{text-align:center; color:var(--dimmer); font-size:11px; margin:12px 0 10px;
+      text-transform:uppercase; letter-spacing:1.4px}
+  button{
+    background:var(--accent); color:var(--onaccent); border:0; border-radius:7px;
+    padding:11px 18px; font-size:13.5px; font-weight:650; cursor:pointer; font-family:inherit;
+  }
+  button:hover{filter:brightness(1.08)}
+  button:disabled{opacity:.45; cursor:default; filter:none}
+  button.ghost{background:transparent; color:var(--fg); border:1px solid var(--line2); font-weight:500}
+  .seg{display:inline-flex; border:1px solid var(--line2); border-radius:7px; overflow:hidden}
+  .seg button{background:transparent; color:var(--dim); border-radius:0; padding:9px 16px; font-weight:500}
+  .seg button.on{background:var(--accent); color:var(--onaccent); font-weight:650}
+  .bar{display:flex; gap:10px; align-items:center; padding:12px 20px; border-top:1px solid var(--line)}
+  .bar .sp{flex:1}
+  .msg{font-size:12.5px; padding:10px 12px; border-radius:7px; margin-top:14px; display:none; line-height:1.5}
+  .msg.err{display:block; background:var(--errbg); border:1px solid var(--errline); color:var(--errfg)}
+  .msg.info{display:block; background:var(--infobg); border:1px solid var(--infoline); color:var(--infofg)}
+  .jdwrap{position:relative}
+  .jdwrap.locked textarea{opacity:.35; filter:grayscale(1); pointer-events:none; user-select:none}
+  .jdwrap .clear{display:none}
+  .jdwrap.locked .clear{
+    display:flex; position:absolute; inset:0; align-items:center; justify-content:center;
+    border-radius:7px; cursor:pointer; transition:background .12s;
+  }
+  .jdwrap.locked .clear:hover{background:var(--veil)}
+  .jdwrap.locked .clear .x{
+    width:46px; height:46px; border-radius:50%; background:var(--panel);
+    border:1px solid var(--line2); color:var(--fg); font-size:24px; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+    opacity:0; transform:scale(.9); transition:opacity .12s, transform .12s;
+  }
+  .jdwrap.locked .clear:hover .x{opacity:1; transform:scale(1)}
+  .setup{display:none; background:var(--panel); border:1px solid var(--line2);
+         border-radius:9px; padding:14px 16px; margin-bottom:18px}
+  .setup.show{display:block}
+  .setup h3{margin:0 0 6px; font-size:13.5px; font-weight:650}
+  .setup p{margin:0; font-size:12.5px; color:var(--dim); line-height:1.5}
+  .setup .fine{margin-top:9px; font-size:11.5px; color:var(--dimmer)}
+  .setup code{font-size:11px}
+  .setup a{color:var(--accent)}
+  .notes{margin-top:18px; display:none}
+  .notes h3{font-size:11px; text-transform:uppercase; letter-spacing:1.1px; color:var(--dimmer);
+            margin:16px 0 7px; font-weight:600}
+  .notes p{margin:0 0 6px; font-size:13px}
+  .chips{display:flex; flex-wrap:wrap; gap:5px}
+  .chip{background:var(--panel); border:1px solid var(--line2); border-radius:20px;
+        padding:3px 10px; font-size:11.5px; color:var(--dim)}
+  .chip.m{border-color:var(--goodline); color:var(--good)}
+  ul.tight{margin:0; padding-left:17px; font-size:13px; color:var(--dim)}
+  ul.tight li{margin-bottom:4px}
+  .flag{color:var(--warn)}
+  .empty{flex:1; display:flex; align-items:center; justify-content:center;
+         color:var(--dimmer); font-size:13.5px; text-align:center; padding:40px; line-height:1.7}
+
+  /* ---------- history ---------- */
+  .right header.rhead{padding:16px 20px 12px; border-bottom:1px solid var(--line)}
+  .hlist{flex:1; overflow-y:auto; padding:12px 14px; display:flex; flex-direction:column; gap:8px}
+  .hrow{
+    background:var(--panel); border:1px solid var(--line); border-radius:9px;
+    box-shadow:var(--shadow);
+    padding:11px 13px; cursor:pointer; transition:border-color .12s, background .12s;
+  }
+  .hrow:hover{border-color:var(--line2); background:var(--hover)}
+  .hrow .co{font-size:13.5px; font-weight:650; color:var(--fg)}
+  .hrow .ro{font-size:12.5px; color:var(--dim); margin-top:1px}
+  .hrow .mt{
+    margin-top:7px; display:flex; flex-wrap:wrap; gap:5px 7px;
+    font-size:11px; color:var(--dimmer);
+  }
+  .hrow .tag{border:1px solid var(--line2); border-radius:20px; padding:2px 8px}
+  .hrow .tag.warn{border-color:var(--warnline); color:var(--warn)}
+  .hrow .tag.good{border-color:var(--goodline); color:var(--good)}
+  .hrow .tag.pay{border-color:var(--goodline); color:var(--good); font-weight:600}
+  .hrow .tag.bad{border-color:var(--errline); color:var(--bad)}
+  .hrow .act{
+    margin-top:9px; display:flex; gap:14px; font-size:11.5px; color:var(--accent);
+    opacity:0; transition:opacity .12s;
+  }
+  .hrow:hover .act{opacity:1}
+  .hrow .act span:hover{text-decoration:underline}
+  .spin{display:inline-block; width:13px; height:13px;
+        border:2px solid color-mix(in srgb, currentColor 28%, transparent);
+        border-top-color:currentColor; border-radius:50%; animation:s .7s linear infinite;
+        vertical-align:-2px; margin-right:7px}
+  @keyframes s{to{transform:rotate(360deg)}}
+
+  /* ---------- the four facts off the advert ---------- */
+  .facts{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line);
+         border:1px solid var(--line); border-radius:9px; overflow:hidden; margin:2px 0 4px;
+         box-shadow:var(--shadow)}
+  .fact{background:var(--panel); padding:9px 11px}
+  .fact .fk{font-size:10px; text-transform:uppercase; letter-spacing:1px;
+            color:var(--dimmer); font-weight:600; margin-bottom:3px}
+  .fact .fv{font-size:13px; color:var(--fg); line-height:1.35}
+  .fact .fsub{font-size:11px; color:var(--dimmer); margin-top:2px}
+  .fact.yes .fv{color:var(--good); font-weight:600}
+  .fact.no  .fv{color:var(--bad);  font-weight:600}
+  .fact.none .fv{color:var(--dimmer); font-weight:400}
+
+  /* ---------- reading (iMessage dots) ---------- */
+  .dots{display:inline-flex; gap:4px; align-items:center; vertical-align:-1px}
+  .dots i{width:5px; height:5px; border-radius:50%; background:currentColor;
+          opacity:.35; animation:blink 1.25s ease-in-out infinite}
+  .dots i:nth-child(2){animation-delay:.18s}
+  .dots i:nth-child(3){animation-delay:.36s}
+  @keyframes blink{0%,60%,100%{opacity:.28; transform:translateY(0)}
+                   30%{opacity:1; transform:translateY(-2px)}}
+  button.holding{animation:hold 1.6s ease-in-out infinite}
+  @keyframes hold{0%,100%{opacity:.42}50%{opacity:.72}}
+  .reading{display:none; align-items:center; gap:9px; margin-top:12px;
+           font-size:12.5px; color:var(--dim)}
+  .reading.on{display:flex}
+  .jdwrap.reading-now textarea{border-color:var(--accent)}
+</style>
+</head>
+<body>
+
+<div class="left">
+  <header>
+    <h1>TCV — Tuned CV</h1>
+    <div class="status" id="status">checking…</div>
+  </header>
+
+  <div class="pane">
+
+    <div id="setup" class="setup">
+      <h3>One thing before you start</h3>
+      <p>TCV tunes through Claude Code when it's installed, which runs on your
+         existing subscription at no extra cost. It isn't here, so it needs an
+         Anthropic API key instead (that one bills per use). Grab one at
+         <a href="https://console.anthropic.com/settings/keys" target="_blank">console.anthropic.com</a>,
+         paste it below, and you will never be asked again.</p>
+      <div class="row" style="margin-top:12px">
+        <div><input type="password" id="key" placeholder="sk-ant-..." autocomplete="off" spellcheck="false"></div>
+        <button id="savekey">Save</button>
+      </div>
+      <p class="fine">Saved to <code>api_key.txt</code> in the TCV folder, readable only by you. It never leaves this machine.</p>
+    </div>
+
+    <label for="jd">Job description</label>
+    <div class="jdwrap" id="jdwrap">
+      <textarea id="jd" placeholder="Paste the advert, or a link to it. Reading starts on its own.
+
+A link on its own gets fetched. Anything longer is treated as the advert itself. LinkedIn, Indeed and Glassdoor block fetching, so paste the text for those.
+
+Cmd-V works anywhere on this page."></textarea>
+      <div class="clear" id="clear" title="Clear and start over"><div class="x">&times;</div></div>
+    </div>
+
+    <div class="reading" id="reading">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span id="readingtxt">Reading the advert…</span>
+    </div>
+
+    <div class="msg" id="msg"></div>
+
+    <div class="notes" id="parsed"></div>
+    <div class="notes" id="notes"></div>
+  </div>
+
+  <div class="bar">
+    <button id="go" style="display:none">Create anyway</button>
+    <div class="seg" id="pages">
+      <button data-p="1" class="on">1 page</button>
+      <button data-p="2">2 pages</button>
+    </div>
+    <div class="sp"></div>
+    <button id="reveal" class="ghost" disabled>Show in Finder</button>
+    <button id="edit" class="ghost" disabled>JSON</button>
+  </div>
+</div>
+
+<div class="right">
+  <header class="rhead">
+    <h1>History</h1>
+    <div class="status" id="hcount"></div>
+  </header>
+  <div class="hlist" id="hlist">
+    <div class="empty">Nothing yet.<br>Every CV you create is logged here.</div>
+  </div>
+</div>
+
+<script>
+let TCV = null;
+const $ = id => document.getElementById(id);
+const msg = (t, cls) => { const m = $('msg'); m.textContent = t; m.className = 'msg ' + (cls||'info'); };
+const clearMsg = () => { $('msg').className = 'msg'; };
+
+let pages = '1';
+
+// A new advert invalidates the last read. Typed or dropped text starts the run
+// once he stops, but only when there is enough of it to be an advert: a pause
+// mid-sentence must not kick off a two-minute write.
+let typeTimer = null;
+$('jd').addEventListener('input', () => {
+  if (PARSED !== null) { PARSED = null; $('parsed').style.display = 'none'; }
+  clearTimeout(typeTimer);
+  typeTimer = setTimeout(() => {
+    const v = $('jd').value.trim();
+    const link = /^https?:\/\/\S+$|^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(v);
+    if (link || v.length >= 400) runParse();
+  }, 1500);
+});
+
+// ---- lock / clear -------------------------------------------------------
+function lockInput()   { $('jdwrap').classList.add('locked'); }
+function unlockInput() { $('jdwrap').classList.remove('locked'); }
+
+function resetAll() {
+  unlockInput();
+  clearTimeout(typeTimer);
+  $('jd').value = '';
+  PARSED = null; TCV = null; LAST = null; LAST_READ = ''; FACTS = null;
+  $('parsed').style.display = 'none';
+  $('notes').style.display = 'none';
+  $('reveal').disabled = true; $('edit').disabled = true;
+  showPhase(false);
+  hideButton();
+  clearMsg();
+  $('jd').focus();
+}
+$('clear').onclick = resetAll;
+
+// ---- paste anywhere -----------------------------------------------------
+document.addEventListener('paste', e => {
+  const t = e.target;
+  // let a real edit inside an unlocked field behave normally
+  if (t && (t.id === 'jd' || t.tagName === 'INPUT') && !$('jdwrap').classList.contains('locked')) return;
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  if (!text || !text.trim()) return;
+  e.preventDefault();
+  if ($('jdwrap').classList.contains('locked')) resetAll();   // a new advert replaces the old
+  $('jd').value = text.trim();
+  PARSED = null;
+  $('parsed').style.display = 'none';
+  $('jd').focus();
+  clearTimeout(typeTimer);
+  runParse();
+});
+$('pages').onclick = async e => {
+  if (e.target.tagName !== 'BUTTON') return;
+  if (e.target.dataset.p === pages) return;
+  [...$('pages').children].forEach(b => b.classList.toggle('on', b === e.target));
+  pages = e.target.dataset.p;
+  // there is already a CV on screen: reprint it to the new budget, no re-tune
+  if (!TCV || CREATING || READING) return;
+  showPhase(true, 'Reprinting to ' + pages + ' page' + (pages === '1' ? '' : 's') + '…');
+  try {
+    const d = await post('/api/pdf', { tcv: TCV, pages });
+    LAST = Object.assign({}, d);
+    loadHistory();
+    report(d);
+  } catch (err) { msg(err.message, 'err'); }
+  finally { showPhase(false); }
+};
+
+const NEEDS_API = 5;
+function paintHealth(d) {
+  if ((d.api || 0) < NEEDS_API) {
+    msg('This page is newer than the running server. Quit TCV (close its Terminal window) and open it again.', 'err');
+  }
+  const t = d.cli ? '<b>subscription</b>'
+                  : (d.api_key ? '<b>API key</b>' : '<b class="bad">no way to tune</b>');
+  const c = d.chrome ? '<b>chrome ok</b>' : '<b class="bad">no chrome</b>';
+  const o = (d.out_dir || '').replace(/^\/Users\/[^/]+/, '~');
+  $('status').innerHTML = `${t} · ${c} · master ${(d.master_bytes/1024).toFixed(0)}kb` + (o ? ` · → ${o}` : '');
+  // only ask for a key when there is no Claude Code CLI to fall back on
+  $('setup').classList.toggle('show', !d.cli && !d.api_key);
+}
+
+$('savekey').onclick = async () => {
+  const key = $('key').value.trim();
+  if (!key) return;
+  const btn = $('savekey');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    await post('/api/key', { key });
+    $('key').value = '';
+    const d = await fetch('/api/health').then(r => r.json());
+    paintHealth(d);
+    msg('Key saved. You are set: paste a job description and it starts reading.', 'info');
+  } catch (e) {
+    msg(e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save';
+  }
+};
+
+fetch('/api/health').then(r => r.json()).then(d => {
+  paintHealth(d);
+}).catch(() => $('status').textContent = 'server unreachable');
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+
+let ticker = null;
+function startTicker() {
+  const t0 = Date.now();
+  const tick = () => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    const mm = Math.floor(s / 60), ss = String(s % 60).padStart(2, '0');
+    showPhase(true, `Writing your CV against this advert… ${mm}:${ss}`);
+    msg(s < 150
+      ? 'Weighing every role in the master CV against the advert, then printing the PDF. Usually about two minutes.'
+      : `Still going at ${mm}:${ss}. Longer than usual. If it passes 4 minutes, check the Terminal window for an error.`,
+      'info');
+  };
+  tick();
+  ticker = setInterval(tick, 1000);
+}
+function stopTicker() { if (ticker) clearInterval(ticker); ticker = null; }
+
+let LAST = null;   // the last created PDF, for Show in Finder
+
+function report(d) {
+  const pct = Math.round(d.fit * 100);
+  const where = (d.folder || '').replace(/^\/Users\/[^/]+/, '~');
+  msg('Saved to  ' + where + '/' + d.filename +
+      '  ·  ' + d.pages + ' page' + (d.pages === 1 ? '' : 's') +
+      '  ·  ' + (d.bytes/1024).toFixed(0) + ' kb' +
+      (d.fitted && !d.overflow ? '  ·  scaled to ' + pct + '% to hold ' + d.budget + ' page' + (d.budget === 1 ? '' : 's') : '') +
+      (d.overflow ? '   ⚠ still over at ' + pct + '%, the type floor is reached. Cut a bullet via JSON, or switch to ' + d.pages + ' pages.' : ''),
+      d.overflow ? 'err' : 'info');
+}
+
+// ---- history --------------------------------------------------------------
+function when(iso) {
+  const d = new Date(iso), n = new Date();
+  const sameDay = d.toDateString() === n.toDateString();
+  const t = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  return sameDay ? 'Today ' + t : d.toLocaleDateString([], {day: 'numeric', month: 'short'}) + ' ' + t;
+}
+
+function renderHistory(items) {
+  const list = $('hlist');
+  $('hcount').textContent = items.length
+    ? items.length + (items.length === 1 ? ' CV created' : ' CVs created')
+    : '';
+  if (!items.length) {
+    list.innerHTML = '<div class="empty">Nothing yet.<br>Every CV you create is logged here.</div>';
+    return;
+  }
+  list.innerHTML = items.map((it, i) => {
+    const pct = Math.round((it.fit || 1) * 100);
+    const tags = [
+      it.salary ? `<span class="tag pay">${esc(it.salary)}</span>` : '',
+      it.remote ? `<span class="tag">${esc(it.remote)}</span>` : '',
+      it.portugal === 'Yes' ? `<span class="tag good">Portugal${it.europe === 'Yes' ? ' · Europe' : ''}</span>`
+        : it.portugal === 'No' ? `<span class="tag bad">Not Portugal${it.country ? ' · ' + esc(it.country) : ''}</span>`
+        : (it.country ? `<span class="tag">${esc(it.country)}</span>` : ''),
+      `<span class="tag">${it.pages} page${it.pages === 1 ? '' : 's'}</span>`,
+      pct < 100 ? `<span class="tag">${pct}%</span>` : '',
+      it.overflow ? `<span class="tag warn">over budget</span>` : '',
+      it.unmet ? `<span class="tag warn">${it.unmet} unmet</span>` : `<span class="tag good">no blockers</span>`
+    ].filter(Boolean).join('');
+    return `<div class="hrow" data-i="${i}">
+      <div class="co">${esc(it.company || 'Unknown company')}</div>
+      <div class="ro">${esc(it.role || '')}</div>
+      <div class="mt">${tags}<span class="tag">${when(it.at)}</span></div>
+      <div class="act"><span data-a="open">Open PDF</span><span data-a="reveal">Show in Finder</span></div>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.hrow').forEach(row => {
+    const it = items[+row.dataset.i];
+    row.onclick = e => {
+      const a = e.target.dataset.a;
+      if (a === 'reveal') post('/api/reveal', { path: it.path }).catch(er => msg(er.message, 'err'));
+      else window.open(it.url, '_blank');
+    };
+  });
+}
+
+async function loadHistory() {
+  try { renderHistory((await (await fetch('/api/history')).json()).items || []); }
+  catch (e) { /* history is a nicety, never block on it */ }
+}
+loadHistory();
+
+let PARSED = null;   // the resolved JD text, once the read has confirmed it
+
+// ---- the run: paste -> read -> write, no buttons -------------------------
+// The whole thing is automatic. The button in the bar only appears when the
+// chain stops on its own: the advert looked wrong, or something failed.
+let READING  = false;    // a read is in flight
+let CREATING = false;    // a write is in flight; never read under it
+let LAST_READ = '';      // the raw input PARSED came from
+
+function showPhase(on, txt) {
+  $('reading').classList.toggle('on', on);
+  $('jdwrap').classList.toggle('reading-now', on);
+  if (txt) $('readingtxt').textContent = txt;
+}
+function offerButton(label, fn) {
+  const b = $('go');
+  b.style.display = '';
+  b.textContent = label;
+  b.disabled = false;
+  b.onclick = fn;
+}
+function hideButton() { $('go').style.display = 'none'; }
+
+// The four things he wants to know before he spends an evening on an application.
+// Blank is shown, not hidden: "not stated" about pay is itself a fact about the job.
+// Location is not a list, it is a verdict. He is in Lisbon: the only question a
+// list of countries answers is whether Portugal is on it.
+let FACTS = null;
+function whereCell() {
+  const pt = FACTS.portugal, eu = FACTS.europe === 'Yes';
+  if (pt === 'Yes') return [eu ? 'Yes · Europe-wide' : 'Yes', 'yes', FACTS.country];
+  if (pt === 'No')  return ['No', 'no', FACTS.country];
+  return ['', 'none', FACTS.country];   // the advert never said
+}
+function factsGrid(d) {
+  FACTS = {
+    salary: d.salary || '', remote: d.remote || '', country: d.country || '',
+    portugal: d.portugal || '', europe: d.europe || '',
+    years_experience: d.years_experience || ''
+  };
+  const [where, wcls, wsub] = whereCell();
+  const cells = [
+    ['Salary',   FACTS.salary, FACTS.salary ? 'yes' : 'none', ''],
+    ['Remote',   FACTS.remote, FACTS.remote ? '' : 'none', ''],
+    ['Portugal', where,        wcls, wcls === 'yes' ? '' : wsub],
+    ['Years',    FACTS.years_experience && FACTS.years_experience + ' yrs',
+                 FACTS.years_experience ? '' : 'none', ''],
+  ];
+  return '<div class="facts">' + cells.map(([k, v, cls, sub]) =>
+    `<div class="fact ${cls}">
+       <div class="fk">${k}</div>
+       <div class="fv">${v ? esc(v) : 'not stated'}</div>
+       ${sub ? `<div class="fsub">${esc(sub)}</div>` : ''}
+     </div>`).join('') + '</div>';
+}
+
+async function runParse() {
+  if (CREATING || READING) return;
+  const raw = $('jd').value.trim();
+  if (!raw) return;
+  if (raw === LAST_READ && PARSED !== null) return;   // already read this one
+
+  READING = true;
+  hideButton();
+  const link = /^https?:\/\/|^[\w-]+(\.[\w-]+)+/.test(raw) && !/\s/.test(raw);
+  showPhase(true, link ? 'Fetching the link and reading it…' : 'Reading the advert…');
+  clearMsg(); $('parsed').style.display = 'none'; $('notes').style.display = 'none';
+  let d = null;
+  try {
+    d = await post('/api/parse', { input: raw });
+    if ($('jd').value.trim() !== raw) return;   // it changed mid-read; that run wins
+    PARSED = d.jd;
+    LAST_READ = raw;
+    let h = '';
+    if (d.looks_wrong) {
+      h += `<h3 class="flag">This does not look like a job advert</h3><p class="flag">${esc(d.looks_wrong)}</p>`;
+    }
+    h += `<h3>Captured</h3><p><b>${esc(d.job_title || '—')}</b>${d.company ? ' at ' + esc(d.company) : ''}</p>`;
+    const meta = [d.location, d.seniority, d.domain].filter(Boolean).map(esc).join(' · ');
+    if (meta) h += `<p style="color:var(--dim)">${meta}</p>`;
+    h += factsGrid(d);
+    if ((d.must_haves || []).length)
+      h += `<h3>Hard requirements</h3><ul class="tight">` +
+           d.must_haves.map(x => `<li>${esc(x)}</li>`).join('') + `</ul>`;
+    h += `<h3>Source</h3><p style="color:var(--dimmer);font-size:12px">${d.jd_chars.toLocaleString()} characters read` +
+         (link ? ' from the link' : ' from the paste') + `</p>`;
+    $('parsed').innerHTML = h;
+    $('parsed').style.display = 'block';
+  } catch (e) {
+    msg(e.message, 'err');
+    offerButton('Try again', runParse);
+    return;
+  } finally {
+    READING = false;
+    showPhase(false);
+  }
+
+  // a clean read runs straight into the write; a doubtful one waits for him
+  if (d.looks_wrong) {
+    msg('Stopped: ' + d.looks_wrong + ' Check the panel, then create it anyway if you disagree.', 'err');
+    offerButton('Create anyway', runCreate);
+    return;
+  }
+  runCreate();
+}
+
+async function runCreate() {
+  if (CREATING) return;
+  const raw = $('jd').value.trim();
+  if (!raw) return;
+  CREATING = true;
+  hideButton();
+  clearMsg(); $('notes').style.display = 'none';
+  startTicker();
+  try {
+    const body = PARSED ? { jd: PARSED, pages } : { input: raw, pages };
+    if (FACTS) body.facts = FACTS;
+    const d = await post('/api/create', body);
+    stopTicker();
+    TCV = d.tcv;
+    LAST = d;
+    renderNotes(TCV);
+    loadHistory();
+    $('reveal').disabled = false; $('edit').disabled = false;
+    lockInput();
+    report(d);
+  } catch (e) {
+    msg(e.message, 'err');
+    offerButton('Try again', runCreate);
+  } finally {
+    stopTicker();
+    showPhase(false);
+    CREATING = false;
+  }
+}
+
+$('reveal').onclick = async () => {
+  if (!LAST) return;
+  try { await post('/api/reveal', { path: LAST.path }); }
+  catch (e) { msg(e.message, 'err'); }
+};
+
+$('edit').onclick = async () => {
+  const cur = JSON.stringify(TCV, null, 2);
+  const next = prompt('Edit the TCV JSON, then OK to rebuild the PDF.', cur);
+  if (next === null) return;
+  try { TCV = JSON.parse(next); } catch (e) { return msg('Invalid JSON: ' + e.message, 'err'); }
+  const btn = $('edit');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Rebuilding…';
+  try {
+    const d = await post('/api/pdf', { tcv: TCV, pages });
+    LAST = Object.assign({}, d);
+    renderNotes(TCV);
+    loadHistory();
+    report(d);
+  } catch (e) { msg(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = 'JSON'; }
+};
+
+function chips(arr, cls) {
+  return '<div class="chips">' + (arr||[]).map(t =>
+    `<span class="chip ${cls||''}">${esc(t)}</span>`).join('') + '</div>';
+}
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderNotes(d) {
+  const n = d.tuning_notes || {};
+  let h = '';
+  h += `<h3>Read of the role</h3><p>${esc(n.job_title||'—')} · ${esc(n.seniority||'—')}</p>`;
+  h += `<h3>Led with</h3><p>${esc(n.led_with||'—')}</p>`;
+  if ((n.matched_terms||[]).length) h += `<h3>Matched terms (${n.matched_terms.length})</h3>` + chips(n.matched_terms, 'm');
+  if ((n.compressed_or_cut||[]).length)
+    h += `<h3>Compressed or cut</h3><ul class="tight">` +
+         n.compressed_or_cut.map(x=>`<li>${esc(x)}</li>`).join('') + `</ul>`;
+  if ((n.unmet_requirements||[]).length)
+    h += `<h3 class="flag">Requirements you don't meet</h3><ul class="tight">` +
+         n.unmet_requirements.map(x=>`<li class="flag">${esc(x)}</li>`).join('') + `</ul>`;
+  h += `<h3>Run</h3><p style="color:var(--dimmer);font-size:12px">${esc(d._model||'')} · JD ${d._jd_chars||0} chars · ${pages}-page</p>`;
+  $('notes').innerHTML = h;
+  $('notes').style.display = 'block';
+}
+</script>
+</body>
+</html>

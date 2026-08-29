@@ -1,0 +1,5 @@
+api_key.txt
+output/
+__pycache__/
+.preview/
+history.json

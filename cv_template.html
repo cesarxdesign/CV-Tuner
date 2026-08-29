@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__NAME__ — CV</title>
+<style>
+/* ============================================================
+   TCV STYLESHEET — must stay visually identical to the BCV
+   (cv/web/cv.html). Every tuned CV and the baseline CV are the
+   same document with different words; if they drift, a recruiter
+   who has seen both notices.
+
+   PARSE-SAFE rules that must not be broken:
+   - single column, no float, no flex/grid for the reading path
+   - no tables, no text boxes, no absolute positioning
+   - no page headers/footers (Chrome flag --no-pdf-header-footer)
+   - real selectable text only, no images, no icons
+
+   FIT SCALE — do not remove.
+   Every size and gap is multiplied by var(--fit). The server
+   renders at 1, measures the page count, and steps --fit down
+   until the PDF meets the page budget. That is what guarantees a
+   one-pager. A new size or margin must be written as
+   calc(<value> * var(--fit)) or it won't participate in the fit.
+   ============================================================ */
+
+:root {
+  --fit: __FIT__;
+  /* page margins shrink more slowly than type */
+  --pad: calc(0.80 + 0.20 * var(--fit));
+}
+
+@page { size: A4; margin: 0; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  /* ligatures OFF: "fintech"/"Confirmo"/"flows" must extract as plain
+     letters or exact-match ATS keyword searches miss them */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
+  font-family: Inter, -apple-system, Helvetica, Arial, sans-serif;
+  font-size: calc(11px * var(--fit));
+  line-height: 1.40;
+  color: #111;
+  width: 793.7px;
+  box-sizing: border-box;
+  padding: calc(32px * var(--pad)) calc(48px * var(--pad)) calc(14px * var(--fit));
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; text-decoration: none; }
+
+/* ---------- header ---------- */
+.name {
+  font-size: calc(24px * var(--fit));
+  font-weight: 700;
+  letter-spacing: -0.4px;
+  line-height: 1.12;
+  margin: 0 0 calc(3px * var(--fit));
+}
+.title   { font-size: calc(13.5px * var(--fit)); margin: 0 0 calc(6px * var(--fit)); color: #1a1a1a; }
+.contact { font-size: calc(11px * var(--fit)); margin: 0; color: #333; }
+.contact b { font-weight: 700; color: #111; }
+
+/* ---------- sections ---------- */
+section {
+  border-top: 1px solid #d4d4d4;
+  margin-top: calc(13px * var(--fit));
+  padding-top: calc(9px * var(--fit));
+}
+
+.lbl {
+  font-size: calc(11px * var(--fit));
+  font-weight: 700;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+  margin: 0 0 calc(6px * var(--fit));
+}
+.lblrow { display: flex; align-items: baseline; justify-content: space-between; }
+.lblrow .note {
+  font-size: calc(9.5px * var(--fit));
+  font-weight: 400; color: #555; letter-spacing: 0; text-transform: none;
+}
+.lblrow .note b { color: #111; }
+
+p { margin: 0; text-align: justify; }
+
+/* ---------- skills ---------- */
+.skill { display: flex; margin-bottom: calc(3px * var(--fit)); }
+.skill:last-child { margin-bottom: 0; }
+.skill .k { flex: 0 0 calc(74px * var(--fit)); font-weight: 700; }
+.skill .v { flex: 1; }
+
+/* ---------- experience ---------- */
+.role { margin-bottom: calc(9px * var(--fit)); page-break-inside: avoid; }
+.role:last-child { margin-bottom: 0; }
+.role h3 {
+  font-size: calc(11px * var(--fit));
+  font-weight: 700;
+  margin: 0 0 calc(1px * var(--fit));
+  line-height: 1.3;
+}
+.role h3 .arw  { font-weight: 400; font-size: calc(9.5px * var(--fit)); color: #444; padding: 0 2px 0 3px; }
+.role h3 .when { font-weight: 400; color: #555; }
+
+/* ---------- education ---------- */
+.edu  { margin-bottom: calc(2px * var(--fit)); }
+.edu .when { color: #555; }
+.meta { font-size: calc(10px * var(--fit)); color: #666; margin-top: calc(7px * var(--fit)); }
+</style>
+</head>
+<body>
+
+  <header>
+    <div class="name">__NAME__</div>
+    <div class="title">__HEADLINE__</div>
+    <div class="contact">__CONTACT__</div>
+  </header>
+
+  <section>
+    <div class="lbl">Summary</div>
+    __SUMMARY__
+  </section>
+
+  <section>
+    <div class="lbl">Skills</div>
+    __SKILLS__
+  </section>
+
+  <section>
+    <div class="lbl lblrow">
+      <span>Experience</span>
+      <span class="note">Selected case studies at <b>cesarxdesign.com</b> &#8599;</span>
+    </div>
+    __EXPERIENCE__
+  </section>
+
+  <section>
+    <div class="lbl">Education</div>
+    __EDUCATION__
+    <div class="meta">__LOCATION__</div>
+  </section>
+
+</body>
+</html>
