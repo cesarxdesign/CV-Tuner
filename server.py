@@ -835,7 +835,12 @@ def log_run(entry):
 # Steps the CSS --fit scale down until the PDF meets the page budget.
 # 0.86 is the floor: below that the type is too small to hand to a human,
 # and the honest answer is "this content does not fit, cut a bullet".
-FIT_STEPS = (1.0, 0.975, 0.95, 0.925, 0.90, 0.88, 0.86, 0.84, 0.82)
+# Search from large to small and take the LARGEST fit that still fits the page
+# budget. Steps above 1.0 let a short (under-written) CV grow to fill the page
+# instead of sitting tiny with white space at the bottom; steps below 1.0 shrink
+# an over-long one as before. Either way the page ends up full.
+FIT_STEPS = (1.30, 1.25, 1.20, 1.15, 1.11, 1.08, 1.05, 1.03, 1.0,
+             0.975, 0.95, 0.925, 0.90, 0.88, 0.86, 0.84, 0.82)
 
 
 def build_pdf(doc, basename, budget):
