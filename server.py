@@ -591,7 +591,7 @@ PORTFOLIO = {"confirmo", "done", "done workouts", "mara", "cable", "cable tech",
              "penfold", "starcount"}
 
 
-def render_html(d, fit=1.0):
+def render_html(d, fit=1.0, vj=1.0):
     tpl = read("cv_template.html")
 
     summary = "".join(f"<p>{E(p)}</p>" for p in d.get("summary", []))
@@ -645,6 +645,7 @@ def render_html(d, fit=1.0):
         "__EXPERIENCE__": exp,
         "__EDUCATION__": edu,
         "__FIT__": f"{fit:.3f}",
+        "__VJUST__": f"{vj:.3f}",
     }.items():
         out = out.replace(k, v)
     return out
@@ -843,15 +844,29 @@ FIT_STEPS = (1.30, 1.25, 1.20, 1.15, 1.11, 1.08, 1.05, 1.03, 1.0,
              0.975, 0.95, 0.925, 0.90, 0.88, 0.86, 0.84, 0.82)
 
 
+VJUST_STEPS = (1.0, 1.15, 1.3, 1.5, 1.7, 1.9, 2.1, 2.4, 2.7, 3.0)
+
 def build_pdf(doc, basename, budget):
-    """Render, measure, shrink, repeat. Returns (path, pages, fit, fitted)."""
+    """Render, measure, shrink, repeat, then SPREAD to fill. Returns
+    (path, pages, fit, fitted). First pick the largest font fit that lands
+    inside the page budget; then open up the gaps between sections and roles
+    (vj) as far as they go without spilling to a new page, so the page ends
+    up full instead of stopping two thirds down."""
     budget = int(budget or 1)
     path = pages = None
     for i, fit in enumerate(FIT_STEPS):
-        path = make_pdf(render_html(doc, fit), basename)
+        path = make_pdf(render_html(doc, fit, 1.0), basename)
         pages = pdf_pages(path)
         if pages <= budget:
-            return path, pages, fit, i > 0
+            # fill the remaining white space by spreading the vertical gaps
+            best = path
+            for vj in VJUST_STEPS[1:]:
+                p = make_pdf(render_html(doc, fit, vj), basename)
+                if pdf_pages(p) <= budget:
+                    best = p
+                else:
+                    break
+            return best, budget, fit, i > 0
     return path, pages, FIT_STEPS[-1], True
 
 
