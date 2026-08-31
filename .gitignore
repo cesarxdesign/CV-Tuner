@@ -3,3 +3,4 @@ output/
 __pycache__/
 .preview/
 history.json
+oauth_token.txt

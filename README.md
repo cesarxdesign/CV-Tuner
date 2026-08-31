@@ -39,13 +39,13 @@ then open **http://localhost:8765**. Port busy? `TCV_PORT=8766 python3 server.py
 
 ## Using it
 
-**One box.** Paste the advert into it, or paste a link to the advert. A link on its own gets fetched; anything longer is treated as the advert text. LinkedIn, Indeed and Glassdoor hard-block automated fetching, so paste the text for those. That isn't a bug and can't be fixed.
+**One box.** Paste the advert into it, or paste a link to the advert. A link on its own gets fetched through a four-rung ladder — the ATS's own structured data (Greenhouse, Lever, SmartRecruiters, Recruitee, Workable APIs, schema.org JobPosting), a plain fetch, headless Chrome rendering the page's JavaScript, and finally Claude fetching it — and every rung's output is validated as a real job advert before it's accepted. If all four fail, the error names what each one saw; paste the text then.
 
 **Cmd-V works anywhere on the page** — you don't have to click into the box first. Pasting over a finished run clears it and starts fresh.
 
 1. Pick **1 page or 2**.
-2. **Parse.** Fifteen seconds, runs on a fast model. Confirms the advert was actually read and shows what it captured: title, company, location, seniority, hard requirements. If a link came back as a cookie banner or a login wall, this is where you find out, before spending two minutes on it. Optional, but cheap.
-3. **Create TCV.** About two minutes. Tunes, previews on the right, and writes the PDF to `~/Desktop/TCV/<company-role>/Cesar Garcia CV.pdf`. The input greys out when it's done; hover it and click the **×** to clear and start over. **Show in Finder** opens the folder.
+2. **Parse.** Fifteen seconds, runs on a fast model. Confirms the advert was actually read and shows what it captured: title, company, location, seniority, hard requirements. If a link came back as a cookie banner or a login wall, this is where you find out. Optional, but cheap.
+3. **Create TCV.** Quality-first, expect **10–20 minutes** with live progress: read the JD into a term bank → write the full account of every role → adversarial keyword-coverage audit (the JD's exact strings, verbatim) → claim-by-claim traceability audit against the master → compress the least relevant roles and expand the most relevant, re-rendering the real PDF between passes, until the content exactly fills the page. Writes the PDF to `~/Desktop/TCV/<company-role>/Cesar Garcia CV.pdf`. The input greys out when it's done; hover it and click the **×** to clear and start over. **Show in Finder** opens the folder.
 
 ### The panel on the left after creating
 
@@ -96,7 +96,7 @@ Opens the raw tuned CV for editing, then re-renders. Use it when one bullet is n
 
 **A model error mentioning the model name** — model IDs change. The app auto-picks the newest available on your key, but you can pin one: `TCV_MODEL=<id> python3 server.py`. `curl` the models endpoint or check the console to see what you have.
 
-**PDF ran to 2 pages on a 1-page budget** — it shouldn't. The renderer shrinks the type in steps until the page count is met, down to a floor of 82%. If it still overflows, the download message says so and the honest fix is to cut a bullet via the JSON button.
+**PDF ran to 2 pages on a 1-page budget** — it shouldn't. The design never changes to make content fit: type does not scale, gaps do not stretch. The fit loop rewrites the least relevant roles shorter (fresh rewrites, never truncations) until the real rendered PDF meets the budget, then expands the most relevant roles until the page is full. If it still overflows after eight rounds, the message says so and the honest fix is to cut a bullet via the JSON button.
 
 ---
 

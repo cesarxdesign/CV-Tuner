@@ -1,0 +1,76 @@
+# Baseline CV text, extracted from cv/web/cv.html (the BCV). Used only to
+# score ATS term coverage of the untuned CV against a JD term bank.
+# Regenerate after a BCV change: python3 -c "see server sync notes"
+
+Cesar Garcia - CV
+
+Cesar Garcia
+
+Founding Designer - Lead Product Designer - Senior IC
+
+cesarxdesign.com -
+cesarxdesign@gmail.com -
+linkedin.com/in/cesarxdesign
+
+Summary
+
+Twice a founding designer, an engineer by training, AI-native end to end: design, building, shipping. I turn high-stakes technical constraints into proven, unique, simple solutions, tuned to human behavior. 200M+ users across payments, pensions, crypto, financial crime, consumer and SaaS.
+
+Skills
+
+Design
+Design systems, Product strategy, User research, Prototyping, Information architecture, Design leadership and hiring, Data-led design, iOS, Android and web
+
+Domains
+Payments, Cryptocurrency and Web3, Digital wallets, KYC / AML, Financial crime compliance, Pensions, AI products
+
+Tools
+Figma, Claude Code, OpenAI Codex, AI-assisted prototyping and engineering
+
+Roles
+Founding designer, design lead, or hands-on individual contributor at staff / principal scope
+
+Experience
+Selected case studies at cesarxdesign.com ↗
+
+Product Design Lead, Confirmo ↗ (Sep 2025 - Jul 2026)
+
+First designer at a crypto payments processor moving $750M a year. Owned the full buyer-and-merchant surface plus brand, built the design system from scratch, and moved design to the front of product with the CPO. Redesigned a checkout stuck at 9% success to 27% overall and 43% in key markets, adding $135M a year in converted payments with zero backend changes. Launched Confirmo Subscriptions with Circle and Solana, the first recurring crypto payments product of its kind. The results accelerated Confirmo's shift to API-first enterprise clients.
+
+Co-Founder, DONE ↗ (Side venture, Mar 2018 - Mar 2020 and May 2024 - Present)
+
+Consumer fitness app, three versions in eight years. Led product strategy and UX/UI. Launched March 2020, earning a 5.0 App Store rating within two months, just before every gym on earth went into lockdown. Now building it solo, with AI covering the engineering that once took two people, and a relaunch set for 2026.
+
+Lead Product Designer, Trust Wallet (Apr 2025 - Sep 2025)
+
+Lead designer on the Banking/Fiat Squad, the bridge between traditional money and crypto, 200M+ users. Rebuilt the new-wallet and import flows and overhauled fiat-to-crypto funding, turning serious technical complexity into something users could trust. Built on Binance's design framework, cross-functional with product, engineering and data. Shipped.
+
+Lead Product Designer, BLKBOX.ai (Mar 2024 - Mar 2025)
+
+Lead designer at an AI creative-testing and production platform for advertisers. Ran a full UX audit and user interviews, working with the CTO to scope what engineering could ship, including a Super Bowl campaign producing AI ads across markets with the NFL as direct client.
+
+Head of Design and Product Owner, Mara ↗ (Nov 2022 - Feb 2024)
+
+Crypto/fiat wallet for African markets, Coinbase as lead investor. Ran three cross-functional teams across design, engineering and support, presenting strategy directly to investors. Full end-to-end redesign in under a month, shipping to 24M users. Rebuilt onboarding from 27 screens to 8, moving KYC and other verifications to the point of need: completion rose from 12% to 88%, adding 20M users and saving $6.9M a year.
+
+Founding Designer, Cable ↗ (Jul 2020 - Oct 2022)
+
+First designer at the only financial-crime and AML compliance startup with a live product. Turned it from reactive, client-driven builds into a coherent, UX-led compliance suite, mature enough to earn its keep and land the product's first real sale.
+
+Founding Designer, Penfold ↗ (Jun 2019 - May 2020)
+
+First hire, alongside the co-founders and one developer. Took the proof of concept to a live app onboarding real customers in seven days, in time for the funding round, then built a modular design system that halved engineering work. I refocused the product on existing pension holders, driving 6x signups and £4M in first-year AUM.
+
+Head of Product Design, Starcount ↗ (Dec 2015 - May 2019)
+
+First product designer; grew the function to five on the strength of my own product work, managing four designers. Hit a £1M first-year revenue target in 91 days across two product lines launched from scratch and one revived, centered on an audience-intelligence tool built with Twitter and Royal Mail, the first deal of its kind.
+
+Earlier (2006 - 2015)
+
+Designer, Leo Burnett (Apple, Samsung, Mercedes, Vodafone; rebranded Lisbon's commuter rail); Software Engineer, Pfizer (CRM migration with Accenture, UK and India).
+
+Education
+
+FLAG Design Academy (2012 - 2013) · Instituto Superior Técnico, Computer Science (2003 - 2006)
+
+Lisbon, Portugal - Remote across Europe - Portuguese (EU) citizen

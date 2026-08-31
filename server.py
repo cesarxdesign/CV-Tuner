@@ -5,14 +5,27 @@ TCV — Tuned CV generator.
 Local web app. Paste a job description (or a URL), get a parse-safe PDF
 tuned to that job, built only from the verified master CV.
 
+The tuning is a multi-pass pipeline, quality-first:
+
+    1. analyse   — read the JD, build a literal term bank, rank the roles
+    2. account   — write the full, generous account of every role
+    3. coverage  — adversarial audit: every claimable JD term, verbatim
+    4. trace     — every claim must cite its master CV backing, or it dies
+    5. fit       — render the real PDF, compress the least relevant roles
+                   (fresh rewrites, never truncations) until it fits, then
+                   expand the most relevant until the page is full
+
+The design never changes: type does not scale, gaps do not stretch. The
+page is filled by content and only content. --fit stays at 1.0 forever.
+
 Zero third-party dependencies: Python 3 standard library + the Chrome
 you already have installed.
 
     python3 server.py            # then open http://localhost:8765
 
-Requires an Anthropic API key, from either:
-    export ANTHROPIC_API_KEY=sk-ant-...
-or a file named  api_key.txt  next to this script.
+Tuning runs through the Claude Code CLI (your subscription) when it is
+installed; otherwise an Anthropic API key from ANTHROPIC_API_KEY or a
+file named api_key.txt next to this script.
 """
 
 import os
@@ -26,12 +39,13 @@ import socket
 import string
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,8 +56,8 @@ _radar_proc = None  # /api/run-radar single-flight guard
 OUT_DIR = os.path.expanduser(
     os.environ.get("TCV_OUT") or os.path.join("~", "Desktop", "TCV")
 )
-# Scratch: the live preview the UI renders in the iframe. Stays next to the
-# app so it never clutters the Desktop.
+# Scratch: the live preview the UI renders in the iframe, plus the fit loop's
+# probe prints. Stays next to the app so it never clutters the Desktop.
 WORK_DIR = os.path.join(HERE, ".preview")
 # Every CV this tool has made. Survives restarts; lives next to the app, not on
 # the Desktop, because it is a log rather than a deliverable.
@@ -56,7 +70,7 @@ PDF_FILENAME = "Cesar Garcia CV"
 
 # Bumped whenever the UI starts depending on something new in here. The page
 # checks it and tells you to restart rather than failing in a confusing way.
-API = 5
+API = 6
 API_URL = "https://api.anthropic.com/v1/messages"
 MODELS_URL = "https://api.anthropic.com/v1/models"
 API_VERSION = "2023-06-01"
@@ -70,6 +84,17 @@ CHROME_CANDIDATES = [
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
 ]
+
+# The template's geometry, used to convert measured white space into a
+# character budget for the fit passes. A4 at Chrome's 96dpi is 1122.5px tall;
+# body text is 11px at line-height 1.40; a rendered line holds ~125 chars
+# (measured empirically against the real print path, slightly conservative
+# so the expand loop lands under the page, never over).
+PAGE_PX = 1122.5
+LINE_PX = 11 * 1.40
+CHARS_PER_LINE = 125
+# "Flush" = white space at the bottom no taller than about two text lines.
+FLUSH_PX = 2.2 * LINE_PX
 
 
 # --------------------------------------------------------------------------
@@ -119,7 +144,7 @@ def api_request(url, payload=None, method="GET"):
     req.add_header("anthropic-version", API_VERSION)
     req.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:
+        with urllib.request.urlopen(req, timeout=600) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
@@ -146,94 +171,8 @@ def pick_model():
     raise RuntimeError("No models available on this API key.")
 
 
-TCV_TOOL = {
-    "name": "emit_tcv",
-    "description": "Emit the tuned CV.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "headline": {"type": "string", "description": "Title line under the name."},
-            "summary": {
-                "type": "array", "items": {"type": "string"},
-                "description": "1-2 short paragraphs.",
-            },
-            "skills": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "items": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["label", "items"],
-                },
-            },
-            "experience": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "company": {"type": "string"},
-                        "qualifier": {
-                            "type": "string",
-                            "description": "e.g. 'Self-employed'. Empty string if none.",
-                        },
-                        "dates": {"type": "string", "description": "MMM YYYY – MMM YYYY"},
-                        "bullets": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["title", "company", "qualifier", "dates", "bullets"],
-                },
-            },
-            "education": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "institution": {"type": "string"},
-                        "detail": {"type": "string"},
-                        "dates": {"type": "string"},
-                    },
-                    "required": ["institution", "detail", "dates"],
-                },
-            },
-            "tuning_notes": {
-                "type": "object",
-                "properties": {
-                    "job_title": {"type": "string"},
-                    "company": {
-                        "type": "string",
-                        "description": "The hiring company's name, as the JD writes it. "
-                                       "Empty string only if the JD genuinely never names it.",
-                    },
-                    "seniority": {"type": "string"},
-                    "matched_terms": {"type": "array", "items": {"type": "string"}},
-                    "led_with": {"type": "string"},
-                    "compressed_or_cut": {"type": "array", "items": {"type": "string"}},
-                    "unmet_requirements": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "JD requirements Cesar does NOT meet. Be honest.",
-                    },
-                },
-                "required": ["job_title", "company", "seniority", "matched_terms",
-                             "led_with", "compressed_or_cut", "unmet_requirements"],
-            },
-        },
-        "required": ["headline", "summary", "skills", "experience",
-                     "education", "tuning_notes"],
-    },
-}
-
-
-def _user_message(jd_text, pages, note=""):
-    return (
-        "<MASTER_CV>\n" + read("master_cv.md") + "\n</MASTER_CV>\n\n"
-        "<JOB_DESCRIPTION>\n" + jd_text.strip() + "\n</JOB_DESCRIPTION>\n\n"
-        f"<PAGE_BUDGET>{pages}</PAGE_BUDGET>\n\n"
-        + (("<REJECTED_PREVIOUS_ATTEMPT>\n" + note +
-            "\n</REJECTED_PREVIOUS_ATTEMPT>\n\n") if note else "")
-        + "Produce the tuned CV."
-    )
+class NotJSON(RuntimeError):
+    """The model replied, but not with a parseable JSON object."""
 
 
 def _extract_json(text):
@@ -244,7 +183,7 @@ def _extract_json(text):
         text = re.sub(r"\n?```$", "", text).strip()
     start = text.find("{")
     if start < 0:
-        raise RuntimeError("No JSON in the reply.\n" + text[:600])
+        raise NotJSON("No JSON in the reply.\n" + text[:600])
     depth, in_str, esc = 0, False, False
     for i, ch in enumerate(text[start:], start):
         if in_str:
@@ -263,10 +202,10 @@ def _extract_json(text):
             depth -= 1
             if depth == 0:
                 return json.loads(text[start:i + 1])
-    raise RuntimeError("Truncated JSON in the reply.\n" + text[:600])
+    raise NotJSON("Truncated JSON in the reply.\n" + text[:600])
 
 
-# ---- backend 1: Claude Code CLI (runs on your subscription, no API credits) --
+# ---- model backends: Claude Code CLI (subscription) first, API second -------
 
 CLI_CANDIDATES = [
     "~/.claude/local/claude",
@@ -301,29 +240,6 @@ def have_cli():
     return None
 
 
-SCHEMA_NOTE = """
-
----
-
-Return ONE JSON object and absolutely nothing else — no prose, no markdown fence,
-no explanation before or after. It must match this shape exactly:
-
-{
-  "headline": "string",
-  "summary": ["string"],
-  "skills": [{"label": "string", "items": ["string"]}],
-  "experience": [{"title": "string", "company": "string", "qualifier": "string",
-                  "dates": "MMM YYYY - MMM YYYY", "bullets": ["string"]}],
-  "education": [{"institution": "string", "detail": "string", "dates": "string"}],
-  "tuning_notes": {"job_title": "string", "company": "string", "seniority": "string",
-                   "matched_terms": ["string"], "led_with": "string",
-                   "compressed_or_cut": ["string"], "unmet_requirements": ["string"]}
-}
-
-Every field is required. Use "" for a qualifier that does not apply.
-"""
-
-
 def _cli_error(p):
     """Turn the CLI's JSON envelope into one readable sentence."""
     detail = ""
@@ -349,19 +265,47 @@ def _cli_error(p):
     return "Claude Code CLI failed:\n" + detail[:600]
 
 
-def tune_via_cli(jd_text, pages, model=None, note=""):
-    prompt = (read("tuner_prompt.md") + SCHEMA_NOTE + "\n\n" +
-              _user_message(jd_text, pages, note))
-    # Accuracy matters more than speed here — this document goes to employers.
-    model = model or os.environ.get("TCV_MODEL") or "opus"
-    cmd = [have_cli(), "-p", "--output-format", "json",
-           "--model", model,
-           "--disallowed-tools", "Bash Edit Write Read WebFetch WebSearch"]
-    # The CLI prefers ANTHROPIC_API_KEY over the OAuth login when both exist,
-    # which would quietly bill per call. Strip it: this path is the subscription.
-    child_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+def oauth_token():
+    """A long-lived subscription token (`claude setup-token`), the same
+    mechanism GitHub Actions uses. Locally it lives in oauth_token.txt next
+    to this script (gitignored), so tuning survives the interactive login
+    evaporating from the keychain — which it has done before."""
+    t = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if t:
+        return t
+    p = os.path.join(HERE, "oauth_token.txt")
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read().strip()
+    return ""
+
+
+def _cli_env():
+    """A clean environment for the child CLI. Two failure modes to prevent:
+    ANTHROPIC_API_KEY would out-rank the OAuth login and quietly bill per
+    call; and when TCV itself was launched from inside a Claude Code session,
+    the inherited session vars (ANTHROPIC_BASE_URL, CLAUDECODE, CLAUDE_*)
+    make the child CLI act as a nested session with no login of its own.
+    CLAUDE_CODE_OAUTH_TOKEN survives — it is how CI (and a local
+    oauth_token.txt) authenticate on the subscription."""
+    keep = {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"}
+    env = {k: v for k, v in os.environ.items()
+           if k in keep or not (k.startswith(("ANTHROPIC", "CLAUDE"))
+                                or k in ("AI_AGENT", "BAGGAGE"))}
+    tok = oauth_token()
+    if tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
+
+
+def _llm_cli(prompt, model, timeout=600, allow_webfetch=False):
+    tools = "Bash Edit Write Read WebSearch" + ("" if allow_webfetch else " WebFetch")
+    cmd = [have_cli(), "-p", "--output-format", "json", "--model", model,
+           "--disallowed-tools", tools]
+    if allow_webfetch:
+        cmd += ["--allowed-tools", "WebFetch"]
     p = subprocess.run(cmd, input=prompt, capture_output=True,
-                       text=True, timeout=600, env=child_env)
+                       text=True, timeout=timeout, env=_cli_env())
     if p.returncode != 0:
         raise RuntimeError(_cli_error(p))
     try:
@@ -372,14 +316,65 @@ def tune_via_cli(jd_text, pages, model=None, note=""):
         class _P:
             stdout, stderr = json.dumps(env), ""
         raise RuntimeError(_cli_error(_P))
-    out = _extract_json(env.get("result") or "")
     # modelUsage lists every model the CLI touched; the one that actually wrote
-    # the CV is the one with the most output tokens.
+    # the answer is the one with the most output tokens.
     usage = env.get("modelUsage") or {}
     main = max(usage.items(), key=lambda kv: (kv[1] or {}).get("outputTokens", 0))[0] if usage else model
-    out["_model"] = f"{main} (subscription)"
-    return out
+    return env.get("result") or "", f"{main} (subscription)"
 
+
+def _llm_api(prompt, model, max_tokens=8192):
+    model = model if model and "-" in model else pick_model()
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = api_request(API_URL, payload, method="POST")
+    text = "".join(b.get("text", "") for b in resp.get("content", []))
+    return text, model + " (API)"
+
+
+def llm_json(prompt, model=None, timeout=600):
+    """One JSON-returning model call. Prefer the Claude Code CLI — it bills to
+    the subscription, not per call. No silent fallback to the paid API when
+    the CLI is present but broken — that hides the real error behind a billing
+    one. Fix the CLI instead.
+
+    A reply that isn't one JSON object earns exactly one 'JSON only' re-ask:
+    models sometimes narrate their changes before (or instead of) the object,
+    and a 15-minute pipeline must not die on politeness."""
+    backend = (os.environ.get("TCV_BACKEND") or "auto").lower()
+
+    def once(p):
+        if backend != "api" and have_cli():
+            text, used = _llm_cli(p, model or os.environ.get("TCV_MODEL") or "opus",
+                                  timeout)
+        else:
+            if not api_key():
+                raise RuntimeError(
+                    "Can't find the Claude Code CLI, and there's no API key either.\n\n"
+                    "Claude Code is the free path — it runs on your subscription. Install "
+                    "it with `npm i -g @anthropic-ai/claude-code`, run `claude` once to "
+                    "sign in, then restart TCV."
+                )
+            text, used = _llm_api(p, model)
+        return _extract_json(text), used
+
+    try:
+        return once(prompt)
+    except NotJSON as e:
+        return once(prompt +
+                    "\n\n<FORMAT_REJECTION>\nYour previous reply was rejected: " +
+                    str(e).split("\n")[0] + " Reply again with ONLY the JSON "
+                    "object. No prose, no explanation of changes, no markdown "
+                    "fence. The first character of your reply must be { and "
+                    "the last must be }.\n</FORMAT_REJECTION>")
+
+
+# --------------------------------------------------------------------------
+# JD parsing (the quick structured read; also the fetch ladder's gate)
+# --------------------------------------------------------------------------
 
 PARSE_PROMPT = """You are reading a job advert so a designer can check the right text was captured before generating a CV against it.
 
@@ -413,52 +408,296 @@ The advert follows.
 def parse_jd(jd_text):
     """A quick structured read of the advert. Fast model: this is a sanity check,
     not the tuning step."""
-    if have_cli():
-        cmd = [have_cli(), "-p", "--output-format", "json",
-               "--model", os.environ.get("TCV_PARSE_MODEL") or "haiku",
-               "--disallowed-tools", "Bash Edit Write Read WebFetch WebSearch"]
-        child_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-        p = subprocess.run(cmd, input=PARSE_PROMPT + "\n\n" + jd_text[:20000],
-                           capture_output=True, text=True, timeout=180, env=child_env)
-        if p.returncode != 0:
-            raise RuntimeError(_cli_error(p))
-        env = json.loads(p.stdout)
-        if env.get("is_error"):
-            class _P:
-                stdout, stderr = json.dumps(env), ""
-            raise RuntimeError(_cli_error(_P))
-        return _extract_json(env.get("result") or "")
-
-    payload = {
-        "model": pick_model(),
-        "max_tokens": 1200,
-        "messages": [{"role": "user", "content": PARSE_PROMPT + "\n\n" + jd_text[:20000]}],
-    }
-    resp = api_request(API_URL, payload, method="POST")
-    text = "".join(b.get("text", "") for b in resp.get("content", []))
+    prompt = PARSE_PROMPT + "\n\n" + jd_text[:20000]
+    backend = (os.environ.get("TCV_BACKEND") or "auto").lower()
+    if backend != "api" and have_cli():
+        text, _ = _llm_cli(prompt, os.environ.get("TCV_PARSE_MODEL") or "haiku",
+                           timeout=180)
+        return _extract_json(text)
+    text, _ = _llm_api(prompt, os.environ.get("TCV_PARSE_MODEL") or None,
+                       max_tokens=1200)
     return _extract_json(text)
 
 
-# ---- backend 2: Anthropic API (pay per call) --------------------------------
+# --------------------------------------------------------------------------
+# JD fetching — the ladder. A link has to work. Four rungs, each validated:
+#   1. the ATS's own structured data (public JSON APIs, JSON-LD JobPosting)
+#   2. a plain fetch of the page, stripped
+#   3. headless Chrome rendering the page's JavaScript, then stripped
+#   4. Claude fetching the page itself (WebFetch, on the subscription)
+# A rung's output only counts if it reads like a job advert (the parse gate's
+# looks_wrong check), so a cookie wall can never become the JD a CV is tuned
+# against. Either real advert text comes through, or the error names every
+# rung and what it saw.
+# --------------------------------------------------------------------------
 
-def tune_via_api(jd_text, pages, model=None, note=""):
-    model = model or pick_model()
-    payload = {
-        "model": model,
-        "max_tokens": 8000,
-        "system": read("tuner_prompt.md"),
-        "tools": [TCV_TOOL],
-        "tool_choice": {"type": "tool", "name": "emit_tcv"},
-        "messages": [{"role": "user", "content": _user_message(jd_text, pages, note)}],
-    }
-    resp = api_request(API_URL, payload, method="POST")
-    for block in resp.get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == "emit_tcv":
-            out = block["input"]
-            out["_model"] = model + " (API)"
-            return out
-    raise RuntimeError("Model did not return a tuned CV.\n" + json.dumps(resp)[:900])
+URLISH = re.compile(r"^(https?://\S+|[\w-]+(\.[\w-]+)+(/\S*)?)$", re.I)
 
+
+def split_input(raw):
+    """One box, two kinds of input. A single token that looks like an address is
+    a URL; anything else is the advert text."""
+    raw = (raw or "").strip()
+    if raw and len(raw.split()) == 1 and "\n" not in raw and URLISH.match(raw):
+        return "", raw if raw.lower().startswith("http") else "https://" + raw
+    return raw, ""
+
+
+def _http_get(url, timeout=45):
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent",
+                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    req.add_header("Accept-Language", "en")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode(errors="replace")
+
+
+def _strip_html(raw):
+    raw = re.sub(r"(?is)<(script|style|nav|footer|svg)[^>]*>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+    raw = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", raw)
+    txt = re.sub(r"<[^>]+>", " ", raw)
+    txt = html.unescape(txt)
+    txt = re.sub(r"[ \t\xa0]+", " ", txt)
+    txt = re.sub(r"\n\s*\n\s*\n+", "\n\n", txt)
+    txt = "\n".join(l.strip() for l in txt.splitlines())
+    return txt.strip()[:60000]
+
+
+def _jsonld_jobposting(raw_html):
+    """Most job pages embed a schema.org JobPosting. It is the advert's own
+    words with none of the page furniture — the best source there is."""
+    for m in re.finditer(r'(?is)<script[^>]*ld\+json[^>]*>(.*?)</script>', raw_html):
+        blob = m.group(1).strip()
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, list):
+                stack.extend(x)
+                continue
+            if not isinstance(x, dict):
+                continue
+            t = x.get("@type")
+            types = [t] if isinstance(t, str) else (t or [])
+            if "JobPosting" in types:
+                return x
+            stack.extend(v for v in x.values() if isinstance(v, (dict, list)))
+    return None
+
+
+def _jobposting_text(jp):
+    org = jp.get("hiringOrganization") or {}
+    org = org.get("name", "") if isinstance(org, dict) else str(org)
+    loc = ""
+    jl = jp.get("jobLocation")
+    if isinstance(jl, list) and jl:
+        jl = jl[0]
+    if isinstance(jl, dict):
+        addr = jl.get("address") or {}
+        if isinstance(addr, dict):
+            loc = ", ".join(str(addr.get(k, "")) for k in
+                            ("addressLocality", "addressRegion", "addressCountry")
+                            if addr.get(k))
+    parts = [jp.get("title", ""), org, loc,
+             str(jp.get("employmentType", "") or ""),
+             _strip_html(str(jp.get("description", "")))]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _ats_api_text(url):
+    """Known ATS hosts publish the posting as public JSON. Ask for that
+    instead of scraping their JavaScript shell."""
+    u = urlparse(url)
+    host, path = u.netloc.lower(), u.path
+
+    # greenhouse EU boards have no public API host — their pages fetch fine
+    # statically, so only the US host gets the API shortcut.
+    m = re.search(r"(?:boards|job-boards)\.greenhouse\.io$", host)
+    if m:
+        gm = re.search(r"^/(?:embed/job_app.*|([^/]+)/jobs/(\d+))", path)
+        if gm and gm.group(1):
+            d = json.loads(_http_get(
+                f"https://boards-api.greenhouse.io/v1/boards/{gm.group(1)}/jobs/{gm.group(2)}"))
+            body = _strip_html(html.unescape(d.get("content", "")))
+            loc = (d.get("location") or {}).get("name", "")
+            return "\n".join(x for x in (d.get("title", ""), gm.group(1), loc, body) if x)
+
+    if host == "jobs.lever.co":
+        lm = re.search(r"^/([^/]+)/([0-9a-f-]{20,})", path)
+        if lm:
+            d = json.loads(_http_get(
+                f"https://api.lever.co/v0/postings/{lm.group(1)}/{lm.group(2)}"))
+            parts = [d.get("text", ""), lm.group(1),
+                     (d.get("categories") or {}).get("location", ""),
+                     d.get("descriptionPlain") or _strip_html(d.get("description", ""))]
+            for lst in d.get("lists") or []:
+                parts.append(lst.get("text", ""))
+                parts.append(_strip_html(lst.get("content", "")))
+            parts.append(d.get("additionalPlain") or "")
+            return "\n".join(p for p in parts if p)
+
+    if host == "jobs.smartrecruiters.com":
+        sm = re.search(r"^/([^/]+)/(\d{15,})", path)
+        if sm:
+            d = json.loads(_http_get(
+                f"https://api.smartrecruiters.com/v1/companies/{sm.group(1)}/postings/{sm.group(2)}"))
+            parts = [d.get("name", ""), sm.group(1),
+                     (d.get("location") or {}).get("city", "")]
+            for sec in ((d.get("jobAd") or {}).get("sections") or {}).values():
+                if isinstance(sec, dict):
+                    parts.append(sec.get("title", ""))
+                    parts.append(_strip_html(sec.get("text", "")))
+            return "\n".join(p for p in parts if p)
+
+    rm = re.match(r"^([\w-]+)\.recruitee\.com$", host)
+    if rm:
+        om = re.search(r"^/o/([^/]+)", path)
+        if om:
+            d = json.loads(_http_get(
+                f"https://{rm.group(1)}.recruitee.com/api/offers/{om.group(1)}"))
+            offer = d.get("offer") or d
+            return "\n".join(x for x in (
+                offer.get("title", ""), offer.get("company_name", ""),
+                offer.get("location", ""),
+                _strip_html(offer.get("description", "")),
+                _strip_html(offer.get("requirements", ""))) if x)
+
+    if host == "apply.workable.com":
+        wm = re.search(r"^/([^/]+)/j/([^/]+)", path)
+        if wm:
+            d = json.loads(_http_get(
+                f"https://apply.workable.com/api/v2/accounts/{wm.group(1)}/jobs/{wm.group(2)}"))
+            parts = [d.get("title", ""), wm.group(1),
+                     _strip_html(d.get("description", "")),
+                     _strip_html(d.get("requirements", "")),
+                     _strip_html(d.get("benefits", ""))]
+            return "\n".join(p for p in parts if p)
+
+    raise RuntimeError("not a known ATS URL shape")
+
+
+def _static_text(url):
+    raw = _http_get(url)
+    jp = _jsonld_jobposting(raw)
+    if jp:
+        txt = _jobposting_text(jp)
+        if len(txt) >= 250:
+            return txt
+    return _strip_html(raw)
+
+
+def _chrome_text(url):
+    """Render the page's JavaScript with headless Chrome and read the DOM.
+    Same disease as printing: on some macOS builds Chrome writes everything
+    and then never exits. Same medicine: watch the output file, not the
+    process, and take the whole group down once the dump is complete."""
+    chrome = find_chrome()
+    if not chrome:
+        raise RuntimeError("Chrome not found")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "dom.html")
+        argv = [chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+                f"--user-data-dir={os.path.join(tmp, 'profile')}",
+                "--no-first-run", "--no-default-browser-check",
+                "--disable-extensions", "--mute-audio",
+                "--window-size=1280,3000",
+                "--virtual-time-budget=15000", "--timeout=30000",
+                "--dump-dom", url]
+        with open(out, "w", encoding="utf-8") as f:
+            p = subprocess.Popen(argv, stdout=f, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        t0, size, stable = time.time(), -1, 0
+        try:
+            while True:
+                exited = p.poll() is not None
+                try:
+                    cur = os.path.getsize(out)
+                except OSError:
+                    cur = -1
+                if cur > 500 and cur == size:
+                    stable += 1
+                    if stable >= 4 or exited:   # ~1s with no growth = done
+                        break
+                else:
+                    stable = 0
+                size = cur
+                if exited:
+                    break
+                if time.time() - t0 > 45:
+                    break
+                time.sleep(0.25)
+        finally:
+            _kill_group(p)
+        with open(out, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    if len(raw) < 500:
+        raise RuntimeError("Chrome returned no DOM")
+    jp = _jsonld_jobposting(raw)
+    if jp:
+        txt = _jobposting_text(jp)
+        if len(txt) >= 250:
+            return txt
+    return _strip_html(raw)
+
+
+def _claude_text(url):
+    if not have_cli():
+        raise RuntimeError("no Claude Code CLI for the WebFetch rung")
+    prompt = (
+        "Fetch this URL and return the complete job advert text it contains, "
+        "verbatim, as plain text: title, company, location, and the full "
+        "description. Return ONLY the advert text, no commentary. If the page "
+        "is not a job advert (login wall, error page, listing index), return "
+        "exactly: FAILED: <one line saying what the page is>\n\n" + url)
+    text, _ = _llm_cli(prompt, os.environ.get("TCV_PARSE_MODEL") or "haiku",
+                       timeout=240, allow_webfetch=True)
+    text = (text or "").strip()
+    if text.startswith("FAILED:") or len(text) < 250:
+        raise RuntimeError(text[:300] or "empty reply")
+    return text[:60000]
+
+
+def fetch_jd_ladder(url, progress=None):
+    """Turn a link into validated advert text, or explain exactly why not.
+    Returns (jd_text, parse_gate_dict, rung_name)."""
+    say = progress or (lambda *_: None)
+    attempts = []
+    rungs = (("structured", _ats_api_text), ("fetch", _static_text),
+             ("chrome", _chrome_text), ("claude", _claude_text))
+    for name, fn in rungs:
+        say(f"fetching the link ({name})…")
+        try:
+            txt = fn(url)
+        except Exception as e:
+            attempts.append(f"{name}: {str(e)[:160]}")
+            continue
+        if len(txt or "") < 250:
+            attempts.append(f"{name}: only {len(txt or '')} characters came back")
+            continue
+        try:
+            gate = parse_jd(txt)
+        except Exception as e:
+            attempts.append(f"{name}: gate check failed ({str(e)[:120]})")
+            continue
+        if gate.get("looks_wrong"):
+            attempts.append(f"{name}: {gate['looks_wrong'][:160]}")
+            continue
+        say(f"link resolved via {name}: {len(txt):,} characters")
+        return txt, gate, name
+    raise RuntimeError(
+        "Couldn't get a job advert out of that link. Tried every method:\n- "
+        + "\n- ".join(attempts) +
+        "\n\nOpen the posting, select all, and paste the text instead.")
+
+
+# --------------------------------------------------------------------------
+# the no-invention verifier (mechanical)
+# --------------------------------------------------------------------------
 
 def _walk_strings(x):
     if isinstance(x, str):
@@ -509,73 +748,395 @@ def verify_doc(doc):
     seen = set()
     return [b for b in bad if not (b in seen or seen.add(b))]
 
-def tune(jd_text, pages, model=None, note=""):
-    """Prefer the Claude Code CLI — it bills to your subscription, not per call.
-    Fall back to the API only when the CLI is absent or fails."""
-    backend = (os.environ.get("TCV_BACKEND") or "auto").lower()
 
-    if backend != "api" and have_cli():
-        # No silent fallback to the paid API when the CLI is present but broken —
-        # that hides the real error behind a billing one. Fix the CLI instead.
-        return tune_via_cli(jd_text, pages, model, note)
+# --------------------------------------------------------------------------
+# coverage — the ATS-term scoreboard (mechanical, verbatim)
+# --------------------------------------------------------------------------
 
-    if not api_key():
-        raise RuntimeError(
-            "Can't find the Claude Code CLI, and there's no API key either.\n\n"
-            "Claude Code is the free path — it runs on your subscription. Install "
-            "it with `npm i -g @anthropic-ai/claude-code`, run `claude` once to "
-            "sign in, then restart TCV."
-        )
-    return tune_via_api(jd_text, pages, model, note)
+def doc_text(doc):
+    """The CV's actual words: everything except tuning notes and private keys,
+    so the scoreboard can't be gamed by listing terms in the notes."""
+    d = {k: v for k, v in doc.items()
+         if k != "tuning_notes" and not str(k).startswith("_")}
+    return " ".join(_walk_strings(d))
+
+
+def term_hits(terms, text):
+    """Which of the JD's literal strings appear in the text. Case-insensitive
+    (ATS search is), but the string itself must match verbatim: 'UX/UI' and
+    'UI/UX' are different terms. Whitespace is flexible so a line wrap never
+    hides a match."""
+    hits = []
+    for t in terms:
+        t = (t or "").strip()
+        if not t:
+            continue
+        pat = re.escape(t)
+        pat = re.sub(r"(?:\\\s)+", r"\\s+", pat)
+        if re.search(r"(?<![A-Za-z0-9])" + pat + r"(?![A-Za-z0-9])",
+                     text, re.I):
+            hits.append(t)
+    return hits
+
+
+def baseline_text():
+    p = os.path.join(HERE, "baseline_cv.txt")
+    if os.path.exists(p):
+        return read("baseline_cv.txt")
+    return ""
 
 
 # --------------------------------------------------------------------------
-# JD fetching
+# the tuning pipeline
 # --------------------------------------------------------------------------
 
-BLOCKED_HOSTS = ("linkedin.com", "indeed.com", "glassdoor.")
+DOC_SCHEMA = """
+Return ONE JSON object and absolutely nothing else — no prose, no markdown fence,
+no explanation before or after, never a description of what you changed. The
+first character of your reply is { and the last is }. It must match this shape
+exactly:
+
+{
+  "headline": "string",
+  "summary": ["string"],
+  "skills": [{"label": "string", "items": ["string"]}],
+  "experience": [{"title": "string", "company": "string", "qualifier": "string",
+                  "dates": "MMM YYYY - MMM YYYY", "bullets": ["string"]}],
+  "education": [{"institution": "string", "detail": "string", "dates": "string"}],
+  "tuning_notes": {"job_title": "string", "company": "string", "seniority": "string",
+                   "matched_terms": ["string"], "led_with": "string",
+                   "compressed_or_cut": ["string"], "unmet_requirements": ["string"]}
+}
+
+Every field is required. Use "" for a qualifier that does not apply.
+"""
+
+ANALYZE_SCHEMA = """
+Return ONE JSON object and absolutely nothing else:
+
+{
+  "company": "hiring company as the JD writes it, \\"\\" only if truly never named",
+  "job_title": "the role title as written",
+  "seniority": "one short phrase",
+  "domain": "one short phrase",
+  "stage": "pre-seed/seed | Series A-B scale-up | growth | enterprise | unknown",
+  "ic_or_management": "IC" or "management",
+  "led_with": "one sentence: what this CV should lead with and why",
+  "must_haves": ["hard requirements, each under 12 words"],
+  "unmet_requirements": ["JD requirements Cesar does NOT meet. Be honest."],
+  "term_bank": [
+    {"term": "the JD's literal string, exact capitalisation and punctuation",
+     "claimable": true,
+     "evidence": "where MASTER_CV backs it (section or quote), \\"\\" when claimable is false"}
+  ],
+  "role_ranking": ["every role key, most relevant to this JD first"]
+}
+
+term_bank rules:
+- 15 to 30 terms: the skills, methods, tools, domains, platforms and phrases a
+  recruiter would actually search for. Capture the JD's OWN spelling: if it
+  says "UX/UI" the term is "UX/UI", not "UI/UX"; "0-1" not "0→1".
+- claimable=true ONLY when MASTER_CV genuinely backs the capability (possibly
+  under a different label — the JD's string then becomes the spelling used).
+- claimable=false for anything Cesar cannot honestly claim. These never go on
+  the CV; they exist so the shortfall is visible.
+role_ranking uses exactly these keys, all nine, ordered for THIS JD:
+["Confirmo", "DONE", "Trust Wallet", "BLKBOX.ai", "Mara", "Cable", "Penfold",
+ "Starcount", "Earlier"]
+"""
+
+CRITIC_SCHEMA = """
+Return ONE JSON object and absolutely nothing else:
+
+{
+  "missing_claimable": [
+    {"term": "a claimable term-bank string absent from the CV",
+     "where": "which role or section should honestly carry it",
+     "evidence": "the MASTER_CV backing"}
+  ],
+  "not_verbatim": [
+    {"jd_term": "the JD's exact string", "cv_says": "the near-miss wording on the CV"}
+  ],
+  "wasted": ["sentences spending space on things this JD never asks about, quoted"],
+  "verdict": "revise" or "done"
+}
+
+You are the recruiter running keyword searches over the parsed CV. A term only
+counts when it appears VERBATIM (case-insensitive, but the string itself exact).
+"done" only when nothing actionable remains.
+"""
+
+TRACE_SCHEMA = """
+Return ONE JSON object and absolutely nothing else:
+
+{
+  "violations": [
+    {"quote": "the CV sentence or phrase", "reason": "why MASTER_CV does not back it"}
+  ]
+}
+
+Go claim by claim through the CV: every skill, tool, domain, method, outcome,
+scope and title. For each, find the MASTER_CV passage that backs it. Rephrasing
+and the JD's spelling of a backed capability are fine. A capability, fact or
+implication with NO backing anywhere in MASTER_CV is a violation — however well
+it matches the JD. An empty violations list means the CV is fully traceable.
+
+Deliberate silently. The violations array carries ONLY your final verdicts:
+claims you conclusively judge unbacked. A candidate you examined and found
+backed, or a defensible rephrase, is NOT a violation and must not appear at
+all — never emit an entry whose reason talks itself into withdrawing.
+"""
 
 
-URLISH = re.compile(r"^(https?://\S+|[\w-]+(\.[\w-]+)+(/\S*)?)$", re.I)
+def _ctx(jd_text, budget):
+    return ("<MASTER_CV>\n" + read("master_cv.md") + "\n</MASTER_CV>\n\n"
+            "<JOB_DESCRIPTION>\n" + jd_text.strip() + "\n</JOB_DESCRIPTION>\n\n"
+            f"<PAGE_BUDGET>{budget}</PAGE_BUDGET>\n")
 
 
-def split_input(raw):
-    """One box, two kinds of input. A single token that looks like an address is
-    a URL; anything else is the advert text."""
-    raw = (raw or "").strip()
-    if raw and len(raw.split()) == 1 and "\n" not in raw and URLISH.match(raw):
-        return "", raw if raw.lower().startswith("http") else "https://" + raw
-    return raw, ""
+def _prompt(jd_text, budget, pass_instructions, extra=""):
+    return (read("tuner_prompt.md") + "\n\n---\n\n" + _ctx(jd_text, budget)
+            + "\n" + extra + "\n" + pass_instructions)
 
 
-def fetch_jd(url):
-    for h in BLOCKED_HOSTS:
-        if h in url:
+def _doc_pass(name, prompt, model, progress):
+    """A pass that emits the full CV JSON. The mechanical no-invention verifier
+    runs on every one; a violation earns exactly one corrective retry."""
+    doc, used = llm_json(prompt, model)
+    v = verify_doc(doc)
+    if v:
+        progress(f"{name}: fact verifier rejected it ({len(v)} violation"
+                 f"{'s' if len(v) != 1 else ''}), redoing the pass")
+        doc, used = llm_json(
+            prompt + "\n\n<REJECTED_PREVIOUS_ATTEMPT>\nYour previous output "
+            "failed the mechanical no-invention verifier:\n- " + "\n- ".join(v) +
+            "\nEvery number and every management word must exist in MASTER_CV. "
+            "Redo the pass.\n</REJECTED_PREVIOUS_ATTEMPT>", model)
+        v = verify_doc(doc)
+        if v:
+            raise RuntimeError(f"{name} failed the no-invention verifier twice:\n- "
+                               + "\n- ".join(v))
+    return doc, used
+
+
+def _bullet_chars(doc):
+    return sum(len(b) for r in doc.get("experience", []) for b in r.get("bullets", []))
+
+
+def tune_pipeline(jd_text, budget, model=None, progress=None):
+    """The whole flow: analyse → account → coverage → trace → fit-to-full-page.
+    Returns (doc, meta) where meta carries coverage and fit measurements."""
+    say = progress or (lambda *_: None)
+    budget = int(budget or 1)
+
+    # ---- 1 · analyse the JD ------------------------------------------------
+    say("reading the JD: term bank, requirements, role ranking…")
+    analysis, used = llm_json(_prompt(jd_text, budget, ANALYZE_SCHEMA,
+        extra="PASS: ANALYSE. Read the JOB_DESCRIPTION against MASTER_CV and "
+              "return the analysis object below. The term bank is the "
+              "foundation of everything downstream: capture the JD's literal "
+              "strings.\n"), model)
+    terms_all = [t.get("term", "") for t in analysis.get("term_bank", [])]
+    claimable = [t.get("term", "") for t in analysis.get("term_bank", [])
+                 if t.get("claimable")]
+    unclaimable = [t for t in terms_all if t not in claimable]
+    ranking = analysis.get("role_ranking") or []
+    say(f"JD read: {analysis.get('job_title') or '?'}"
+        + (f" at {analysis.get('company')}" if analysis.get("company") else "")
+        + f" · {len(terms_all)} terms in the bank, {len(claimable)} claimable")
+
+    bank_json = json.dumps(analysis, ensure_ascii=False)
+
+    # ---- 2 · the full account ---------------------------------------------
+    say("writing the full account of every role…")
+    doc, used = _doc_pass("full account", _prompt(jd_text, budget,
+        "PASS: FULL ACCOUNT. Write the complete tuned CV, generously: every "
+        "role at its best full length for THIS JD, drawing on the master's "
+        "bullet variants and atomic claims but written fresh against the "
+        "analysis below. A truly full page holds about 4,300 bullet characters "
+        "at one page; aim for 4,800-5,800 total so the server compresses from "
+        "above — err long, never thin. Weave every "
+        "claimable term-bank string in VERBATIM where it is honest. Order: "
+        "reverse chronological, DONE second, Earlier last.\n" + DOC_SCHEMA,
+        extra="<JD_ANALYSIS>\n" + bank_json + "\n</JD_ANALYSIS>\n"), model, say)
+    say(f"full account written: {_bullet_chars(doc):,} bullet characters")
+
+    # ---- 3 · coverage audit ------------------------------------------------
+    for round_no in (1, 2, 3):
+        say(f"coverage audit, round {round_no}…")
+        critic, _ = llm_json(_prompt(jd_text, budget, CRITIC_SCHEMA,
+            extra="<JD_ANALYSIS>\n" + bank_json + "\n</JD_ANALYSIS>\n"
+                  "<CURRENT_CV>\n" + json.dumps(doc, ensure_ascii=False) +
+                  "\n</CURRENT_CV>\n"), model)
+        findings = (critic.get("missing_claimable") or []) + \
+                   (critic.get("not_verbatim") or [])
+        if critic.get("verdict") == "done" or not (
+                findings or critic.get("wasted")):
+            say("coverage audit: clean")
+            break
+        say(f"coverage audit: {len(critic.get('missing_claimable') or [])} missing, "
+            f"{len(critic.get('not_verbatim') or [])} not verbatim, "
+            f"{len(critic.get('wasted') or [])} wasted — revising")
+        doc, used = _doc_pass("coverage revision", _prompt(jd_text, budget,
+            "PASS: COVERAGE REVISION. Apply the critic's findings to the CV "
+            "below and return the full corrected CV. Add each missing claimable "
+            "term verbatim where the critic says it honestly belongs; fix every "
+            "near-miss to the JD's exact string; rewrite or cut the wasted "
+            "sentences in favour of what this JD asks about. Change nothing "
+            "else.\n" + DOC_SCHEMA,
+            extra="<JD_ANALYSIS>\n" + bank_json + "\n</JD_ANALYSIS>\n"
+                  "<CURRENT_CV>\n" + json.dumps(doc, ensure_ascii=False) +
+                  "\n</CURRENT_CV>\n<CRITIC_FINDINGS>\n" +
+                  json.dumps(critic, ensure_ascii=False) +
+                  "\n</CRITIC_FINDINGS>\n"), model, say)
+
+    # ---- 4 · traceability audit -------------------------------------------
+    say("traceability audit: every claim against the master…")
+    for attempt in (1, 2, 3):
+        trace, _ = llm_json(_prompt(jd_text, budget, TRACE_SCHEMA,
+            extra="<CURRENT_CV>\n" + json.dumps(doc, ensure_ascii=False) +
+                  "\n</CURRENT_CV>\n"), model)
+        viols = trace.get("violations") or []
+        if not viols:
+            say("traceability: every claim traces to the master")
+            break
+        if attempt == 3:
             raise RuntimeError(
-                f"{h} blocks automated fetching. Open the posting, select all, "
-                "and paste the text instead — it works just as well."
-            )
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent",
-                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-    with urllib.request.urlopen(req, timeout=45) as r:
-        raw = r.read().decode(errors="replace")
-    raw = re.sub(r"(?is)<(script|style|nav|footer|svg)[^>]*>.*?</\1>", " ", raw)
-    raw = re.sub(r"(?i)<br\s*/?>", "\n", raw)
-    raw = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", raw)
-    txt = re.sub(r"<[^>]+>", " ", raw)
-    txt = html.unescape(txt)
-    txt = re.sub(r"[ \t\xa0]+", " ", txt)
-    txt = re.sub(r"\n\s*\n\s*\n+", "\n\n", txt)
-    txt = "\n".join(l.strip() for l in txt.splitlines())
-    txt = txt.strip()
-    if len(txt) < 250:
-        raise RuntimeError(
-            "That page returned almost no text — it is probably rendered by "
-            "JavaScript. Paste the job description text instead."
-        )
-    return txt[:60000]
+                "Traceability audit still failing after two fix passes:\n- " +
+                "\n- ".join(f"{v.get('quote','')} — {v.get('reason','')}"
+                            for v in viols[:8]))
+        say(f"traceability: {len(viols)} unbacked claim"
+            f"{'s' if len(viols) != 1 else ''} — striking")
+        doc, used = _doc_pass("traceability fix", _prompt(jd_text, budget,
+            "PASS: TRACEABILITY FIX. The audit found claims MASTER_CV does not "
+            "back. Remove or correct each one — replace it with the nearest "
+            "claim the master DOES back, or cut it. Never paper over a "
+            "violation with a synonym. Return the full corrected CV.\n"
+            + DOC_SCHEMA,
+            extra="<CURRENT_CV>\n" + json.dumps(doc, ensure_ascii=False) +
+                  "\n</CURRENT_CV>\n<VIOLATIONS>\n" +
+                  json.dumps(viols, ensure_ascii=False) + "\n</VIOLATIONS>\n"),
+            model, say)
+
+    protected = term_hits(claimable, doc_text(doc))
+
+    # ---- 5 · fit: content only, real renders ------------------------------
+    fit_extra = ("<JD_ANALYSIS>\n" + bank_json + "\n</JD_ANALYSIS>\n"
+                 "<PROTECTED_TERMS>\nThe matched-term set must not shrink. "
+                 "These JD strings are on the CV now and must still be on it, "
+                 "verbatim, after your rewrite:\n" +
+                 json.dumps(protected, ensure_ascii=False) +
+                 "\n</PROTECTED_TERMS>\n")
+
+    def _fit_doc_pass(name, instructions):
+        d, _ = _doc_pass(name, _prompt(jd_text, budget, instructions + DOC_SCHEMA,
+            extra=fit_extra + "<CURRENT_CV>\n" +
+                  json.dumps(doc, ensure_ascii=False) + "\n</CURRENT_CV>\n"),
+            model, say)
+        lost = [t for t in protected if t not in term_hits(protected, doc_text(d))]
+        if lost:
+            say(f"{name}: dropped matched terms {lost} — one retry to re-home them")
+            d, _ = _doc_pass(name, _prompt(jd_text, budget, instructions +
+                "\nYour previous rewrite LOST these matched JD terms: " +
+                json.dumps(lost, ensure_ascii=False) +
+                ". Re-home every one of them verbatim in a surviving sentence.\n"
+                + DOC_SCHEMA,
+                extra=fit_extra + "<CURRENT_CV>\n" +
+                      json.dumps(doc, ensure_ascii=False) + "\n</CURRENT_CV>\n"),
+                model, say)
+        return d
+
+    ranking_json = json.dumps(ranking, ensure_ascii=False)
+    pages = slack = None
+    for it in range(8):
+        pages = probe_pages(doc)
+        if pages <= budget:
+            break
+        tail = probe_slack(doc, pages)
+        over_px = (pages - budget) * PAGE_PX - tail
+        cut = max(180, int(over_px / LINE_PX * CHARS_PER_LINE * 1.15))
+        say(f"fit: {pages} pages, ~{cut} characters over — compressing the "
+            f"least relevant roles (round {it + 1})")
+        doc = _fit_doc_pass("compress",
+            "PASS: COMPRESS. The rendered CV is over the page budget by about "
+            f"{cut} characters of bullet text. Shorten the LEAST relevant "
+            "roles first, per this ranking (most relevant first): "
+            + ranking_json + ". Take a role one level shorter at a time "
+            "(~700 → ~550 → ~400 → ~250 → ~120 characters); spread the cut "
+            "across the bottom of the ranking rather than gutting one role. "
+            "Each shortened role is a FRESH rewrite: the best content at that "
+            "length for this JD, never a truncation. Never drop a role, its "
+            "dates, education, or a summary/skills line entirely. Leave the "
+            "most relevant roles untouched. Return the full CV.\n")
+    else:
+        pages = probe_pages(doc)
+        if pages > budget:
+            say("fit: still over budget after 8 compression rounds — shipping "
+                "the smallest version, flagged as overflow")
+
+    if pages is not None and pages <= budget:
+        for it in range(4):
+            slack = probe_slack(doc, budget)
+            filled = 100 * (1 - slack / PAGE_PX)
+            say(f"fit: fits {budget} page{'s' if budget > 1 else ''}, "
+                f"last page {filled:.0f}% full")
+            if slack <= FLUSH_PX:
+                break
+            add = int((slack - LINE_PX) / LINE_PX * CHARS_PER_LINE)
+            if add < 60:
+                break
+            say(f"fit: room for ~{add} more characters — expanding the most "
+                f"relevant roles (round {it + 1})")
+            cand = _fit_doc_pass("expand",
+                "PASS: EXPAND. The rendered CV fits the page with about "
+                f"{add} characters of white space left at the bottom. Add that "
+                "much bullet text to the MOST relevant roles, per this ranking "
+                "(most relevant first): " + ranking_json + ". Use master "
+                "material not yet on the CV (atomic claims, XL variant detail) "
+                "chosen for THIS JD. Never repeat a fact already on the CV, "
+                "never pad with adjectives, never touch the least relevant "
+                "roles. If the master has nothing honest left to add, add "
+                "less. Return the full CV.\n")
+            if probe_pages(cand) > budget:
+                say("fit: expansion overflowed the page — keeping the previous version")
+                break
+            doc = cand
+        slack = probe_slack(doc, budget)
+
+    # ---- 6 · scoreboard ----------------------------------------------------
+    final_text = doc_text(doc)
+    tuned_hits = term_hits(terms_all, final_text)
+    base = baseline_text()
+    base_hits = term_hits(terms_all, base) if base else []
+    lost_protected = [t for t in protected if t not in tuned_hits]
+
+    notes = doc.setdefault("tuning_notes", {})
+    notes["job_title"] = notes.get("job_title") or analysis.get("job_title", "")
+    notes["company"] = analysis.get("company", "") or notes.get("company", "")
+    notes["seniority"] = notes.get("seniority") or analysis.get("seniority", "")
+    notes["led_with"] = notes.get("led_with") or analysis.get("led_with", "")
+    notes["matched_terms"] = tuned_hits
+    unmet = list(dict.fromkeys((analysis.get("unmet_requirements") or []) +
+                               (notes.get("unmet_requirements") or [])))
+    notes["unmet_requirements"] = unmet
+
+    meta = {
+        "coverage": {
+            "total": len(terms_all),
+            "tuned": len(tuned_hits),
+            "baseline": len(base_hits) if base else None,
+            "matched": tuned_hits,
+            "missing_unclaimable": unclaimable,
+            "missing_claimable": [t for t in claimable if t not in tuned_hits],
+            "lost_in_fit": lost_protected,
+        },
+        "pages": pages,
+        "slack_px": slack,
+        "filled": round(1 - (slack / PAGE_PX), 3) if slack is not None else None,
+        "model": used,
+    }
+    doc["_model"] = used
+    return doc, meta
 
 
 # --------------------------------------------------------------------------
@@ -591,7 +1152,7 @@ PORTFOLIO = {"confirmo", "done", "done workouts", "mara", "cable", "cable tech",
              "penfold", "starcount"}
 
 
-def render_html(d, fit=1.0, vj=1.0):
+def render_html(d, fit=1.0, filler=0):
     tpl = read("cv_template.html")
 
     summary = "".join(f"<p>{E(p)}</p>" for p in d.get("summary", []))
@@ -611,7 +1172,7 @@ def render_html(d, fit=1.0, vj=1.0):
         else:
             head += " "
         # Dates render with a hyphen, like the BCV, whatever the model emitted.
-        dates = (r.get("dates") or "").strip().replace("\u2013", "-").replace("\u2014", "-")
+        dates = (r.get("dates") or "").strip().replace("–", "-").replace("—", "-")
         meta = [x for x in ((r.get("qualifier") or "").strip(), dates) if x]
         if meta:
             head += f'<span class="when">({E(", ".join(meta))})</span>'
@@ -623,7 +1184,7 @@ def render_html(d, fit=1.0, vj=1.0):
     bits = []
     for e in d.get("education", []):
         detail = (e.get("detail") or "").strip()
-        dates = (e.get("dates") or "").strip().replace("\u2013", "-").replace("\u2014", "-")
+        dates = (e.get("dates") or "").strip().replace("–", "-").replace("—", "-")
         piece = E(e.get("institution"))
         if detail:
             piece += f", {E(detail)}"
@@ -645,9 +1206,16 @@ def render_html(d, fit=1.0, vj=1.0):
         "__EXPERIENCE__": exp,
         "__EDUCATION__": edu,
         "__FIT__": f"{fit:.3f}",
-        "__VJUST__": f"{vj:.3f}",
     }.items():
         out = out.replace(k, v)
+    if filler:
+        # The fit loop's measuring stick: a spacer used only in probe prints,
+        # never in a shipped PDF. The trailing dot matters: Chrome silently
+        # drops a final page that carries no ink, so a bare spacer can never
+        # push the page count up and the probe would always read "fits".
+        out = out.replace("</body>",
+                          f'<div style="height:{int(filler)}px"></div>'
+                          f'<div style="font-size:2px;line-height:2px">.</div></body>')
     return out
 
 
@@ -771,18 +1339,24 @@ def _tail(path, n=600):
         return ""
 
 
-def make_pdf(html_str, basename):
+def make_pdf(html_str, basename=None, out_path=None):
+    """Print html_str to a PDF. Either into the application folder under
+    OUT_DIR (basename), or to an explicit path (the fit loop's probes)."""
     chrome = find_chrome()
     if not chrome:
         raise RuntimeError(
             "Chrome not found. Install Google Chrome, or set the path in "
             "CHROME_CANDIDATES at the top of server.py."
         )
-    # basename is the application folder; the file inside is always the same name,
-    # so whatever a recruiter downloads is called "Cesar Garcia CV.pdf".
-    folder = os.path.join(OUT_DIR, basename)
-    os.makedirs(folder, exist_ok=True)
-    pdf_path = os.path.join(folder, PDF_FILENAME + ".pdf")
+    if out_path:
+        pdf_path = out_path
+        os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+    else:
+        # basename is the application folder; the file inside is always the same
+        # name, so whatever a recruiter downloads is called "Cesar Garcia CV.pdf".
+        folder = os.path.join(OUT_DIR, basename)
+        os.makedirs(folder, exist_ok=True)
+        pdf_path = os.path.join(folder, PDF_FILENAME + ".pdf")
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "cv.html")
         with open(src, "w", encoding="utf-8") as f:
@@ -805,6 +1379,45 @@ def make_pdf(html_str, basename):
                 return pdf_path
             last = err
         raise RuntimeError("Chrome failed to produce a PDF.\n" + last)
+
+
+# ---- the fit loop's measuring instruments ---------------------------------
+
+def _probe_path():
+    os.makedirs(WORK_DIR, exist_ok=True)
+    return os.path.join(WORK_DIR, "probe.pdf")
+
+
+def probe_pages(doc):
+    """How many pages does this content really take? Real print path, fit 1.0."""
+    return pdf_pages(make_pdf(render_html(doc), out_path=_probe_path()))
+
+
+def probe_slack(doc, budget):
+    """White space at the bottom of the last allowed page, in px, measured on
+    the REAL print path: binary-search the tallest spacer that still fits.
+    No screen-vs-print approximation — the measuring stick goes through the
+    same Chrome print pipeline as the shipped PDF."""
+    lo, hi = 0, int(PAGE_PX)
+    if pdf_pages(make_pdf(render_html(doc, filler=0), out_path=_probe_path())) > budget:
+        return -1
+    while hi - lo > 6:
+        mid = (lo + hi) // 2
+        p = make_pdf(render_html(doc, filler=mid), out_path=_probe_path())
+        if pdf_pages(p) <= budget:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def build_pdf(doc, basename, budget):
+    """Print the finished CV, design untouched, at fit 1.0. The content was
+    already fitted by the pipeline; this reports honestly if it still spills."""
+    budget = int(budget or 1)
+    path = make_pdf(render_html(doc), basename)
+    pages = pdf_pages(path)
+    return path, pages, 1.0, False
 
 
 def read_history():
@@ -830,44 +1443,118 @@ def log_run(entry):
 
 
 # --------------------------------------------------------------------------
-# fit-to-budget
+# the create flow (shared by the sync API and the UI's background job)
 # --------------------------------------------------------------------------
 
-# Steps the CSS --fit scale down until the PDF meets the page budget.
-# 0.86 is the floor: below that the type is too small to hand to a human,
-# and the honest answer is "this content does not fit, cut a bullet".
-# Search from large to small and take the LARGEST fit that still fits the page
-# budget. Steps above 1.0 let a short (under-written) CV grow to fill the page
-# instead of sitting tiny with white space at the bottom; steps below 1.0 shrink
-# an over-long one as before. Either way the page ends up full.
-FIT_STEPS = (1.30, 1.25, 1.20, 1.15, 1.11, 1.08, 1.05, 1.03, 1.0,
-             0.975, 0.95, 0.925, 0.90, 0.88, 0.86, 0.84, 0.82)
+def create_flow(jd, budget, model=None, facts=None, progress=None):
+    say = progress or (lambda *_: None)
+    doc, meta = tune_pipeline(jd, budget, model, say)
+    doc["_jd_chars"] = len(jd)
+
+    os.makedirs(WORK_DIR, exist_ok=True)
+    with open(os.path.join(WORK_DIR, "preview.html"), "w", encoding="utf-8") as f:
+        f.write(render_html(doc))
+
+    notes = doc.get("tuning_notes", {})
+    base = folder_name(notes.get("company", ""), notes.get("job_title", ""))
+    say("printing the PDF…")
+    p, pages, fit, fitted = build_pdf(doc, base, budget)
+    cov = meta.get("coverage") or {}
+    facts = facts or {}
+    log_run({
+        "at": datetime.now().isoformat(timespec="minutes"),
+        "company": notes.get("company", ""),
+        "role": notes.get("job_title", ""),
+        "seniority": notes.get("seniority", ""),
+        "salary": str(facts.get("salary") or ""),
+        "remote": str(facts.get("remote") or ""),
+        "country": str(facts.get("country") or ""),
+        "portugal": str(facts.get("portugal") or ""),
+        "europe": str(facts.get("europe") or ""),
+        "years": str(facts.get("years_experience") or ""),
+        "pages": pages,
+        "budget": budget,
+        "fit": fit,
+        "filled": meta.get("filled"),
+        "cov": f"{cov.get('tuned', 0)}/{cov.get('total', 0)}" if cov.get("total") else "",
+        "cov_base": (f"{cov['baseline']}/{cov['total']}"
+                     if cov.get("baseline") is not None and cov.get("total") else ""),
+        "overflow": pages > budget,
+        "unmet": len(notes.get("unmet_requirements") or []),
+        "jd_chars": len(jd),
+        "folder": os.path.dirname(p),
+        "path": p,
+        "url": "/output/" + quote(os.path.relpath(p, OUT_DIR)),
+    })
+    say("done")
+    return {
+        "tcv": doc,
+        "coverage": cov,
+        "preview": "/preview.html",
+        "url": "/output/" + quote(os.path.relpath(p, OUT_DIR)),
+        "path": p,
+        "folder": os.path.dirname(p),
+        "filename": os.path.basename(p),
+        "bytes": os.path.getsize(p),
+        "pages": pages,
+        "budget": budget,
+        "fit": fit,
+        "fitted": fitted,
+        "filled": meta.get("filled"),
+        "slack_px": meta.get("slack_px"),
+        "overflow": pages > budget,
+    }
 
 
-VJUST_STEPS = (1.0, 1.15, 1.3, 1.5, 1.7, 1.9, 2.1, 2.4, 2.7, 3.0)
+def _resolve_jd(b, progress=None):
+    """Body → advert text. Accepts jd text, a url field, or the one-box input."""
+    jd = (b.get("jd") or "").strip()
+    url = (b.get("url") or "").strip()
+    if not jd and not url:
+        jd, url = split_input(b.get("input"))
+    gate = None
+    if url and not jd:
+        jd, gate, _rung = fetch_jd_ladder(url, progress)
+    return jd, url, gate
 
-def build_pdf(doc, basename, budget):
-    """Render, measure, shrink, repeat, then SPREAD to fill. Returns
-    (path, pages, fit, fitted). First pick the largest font fit that lands
-    inside the page budget; then open up the gaps between sections and roles
-    (vj) as far as they go without spilling to a new page, so the page ends
-    up full instead of stopping two thirds down."""
-    budget = int(budget or 1)
-    path = pages = None
-    for i, fit in enumerate(FIT_STEPS):
-        path = make_pdf(render_html(doc, fit, 1.0), basename)
-        pages = pdf_pages(path)
-        if pages <= budget:
-            # fill the remaining white space by spreading the vertical gaps
-            best = path
-            for vj in VJUST_STEPS[1:]:
-                p = make_pdf(render_html(doc, fit, vj), basename)
-                if pdf_pages(p) <= budget:
-                    best = p
-                else:
-                    break
-            return best, budget, fit, i > 0
-    return path, pages, FIT_STEPS[-1], True
+
+# --------------------------------------------------------------------------
+# background jobs (the UI's path — a 10-minute tune must not live or die
+# with one long browser request, and progress belongs on screen)
+# --------------------------------------------------------------------------
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def start_job(fn):
+    jid = "%x%s" % (int(time.time() * 1000), os.urandom(2).hex())
+    with JOBS_LOCK:
+        # prune: keep the newest 30
+        for k in sorted(JOBS, key=lambda k: JOBS[k]["t0"])[:-29]:
+            if JOBS[k]["status"] != "running":
+                JOBS.pop(k, None)
+        JOBS[jid] = {"status": "running", "log": [], "result": None,
+                     "error": "", "t0": time.time()}
+
+    def say(msg):
+        line = "%s %s" % (time.strftime("%H:%M:%S"), msg)
+        sys.stderr.write("  job %s: %s\n" % (jid, msg))
+        with JOBS_LOCK:
+            JOBS[jid]["log"].append(line)
+
+    def run():
+        try:
+            result = fn(say)
+            with JOBS_LOCK:
+                JOBS[jid].update(status="done", result=result)
+        except Exception as e:
+            sys.stderr.write("  job %s FAILED: %s\n" % (jid, e))
+            with JOBS_LOCK:
+                JOBS[jid].update(status="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jid
 
 
 # --------------------------------------------------------------------------
@@ -907,12 +1594,26 @@ class Handler(BaseHTTPRequestHandler):
                     "api_key": bool(api_key()),
                     "chrome": find_chrome() or "",
                     "master_bytes": len(read("master_cv.md")),
+                    "baseline": bool(baseline_text()),
                     "out_dir": OUT_DIR,
                     "cli": bool(have_cli()),
                     "api": API,
                 })
             if path == "/api/history":
                 return self._json(200, {"items": read_history()})
+            if path == "/api/job":
+                q = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                jid = (q.get("id") or [""])[0]
+                with JOBS_LOCK:
+                    j = JOBS.get(jid)
+                    if not j:
+                        return self._json(404, {"error": "no such job"})
+                    return self._json(200, {
+                        "status": j["status"], "log": j["log"][-40:],
+                        "result": j["result"] if j["status"] == "done" else None,
+                        "error": j["error"],
+                        "seconds": int(time.time() - j["t0"]),
+                    })
 
             if path == "/api/models":
                 return self._json(200, {"models": list_models()})
@@ -946,114 +1647,40 @@ class Handler(BaseHTTPRequestHandler):
             b = self._body()
 
             if path == "/api/parse":
-                jd = (b.get("jd") or "").strip()
-                url = (b.get("url") or "").strip()
-                if not jd and not url:
-                    jd, url = split_input(b.get("input"))
-                if url and not jd:
-                    jd = fetch_jd(url)
+                jd, url, gate = _resolve_jd(b)
                 if len(jd) < 120:
                     got = "a link" if url else ("%d characters" % len(jd))
                     return self._json(400, {
                         "error": "Nothing usable came through (%s). If you pasted a link, the page "
                                  "may block fetching or need a login: paste the advert text instead."
                                  % got})
-                out = parse_jd(jd)
+                out = gate or parse_jd(jd)
                 out["jd_chars"] = len(jd)
                 out["jd"] = jd          # hand the resolved text back so Create does not refetch
                 out["excerpt"] = jd[:400]
                 return self._json(200, out)
 
             if path == "/api/create":
-                # One shot: tune, preview, print. This is what the button calls.
-                jd = (b.get("jd") or "").strip()
-                url = (b.get("url") or "").strip()
-                if not jd and not url:
-                    jd, url = split_input(b.get("input"))
-                if url and not jd:
-                    jd = fetch_jd(url)
+                # The whole pipeline: analyse, write, audit, fit, print.
+                budget = 2 if str(b.get("pages")) == "2" else 1
+                model = b.get("model") or None
+                facts = b.get("facts") or {}
+
+                if b.get("async"):
+                    body = dict(b)
+
+                    def job(say):
+                        jd, url, gate = _resolve_jd(body, say)
+                        if len(jd) < 120:
+                            raise RuntimeError("Job description is too short to tune against.")
+                        return create_flow(jd, budget, model, facts, say)
+
+                    return self._json(200, {"job": start_job(job)})
+
+                jd, url, gate = _resolve_jd(b)
                 if len(jd) < 120:
                     return self._json(400, {"error": "Job description is too short to tune against."})
-                budget = 2 if str(b.get("pages")) == "2" else 1
-
-                doc = tune(jd, budget, b.get("model") or None)
-                violations = verify_doc(doc)
-                if violations:
-                    doc = tune(jd, budget, b.get("model") or None,
-                               note="Your previous CV was rejected by the fact "
-                                    "verifier. Violations:\n- " + "\n- ".join(violations))
-                    violations = verify_doc(doc)
-                    if violations:
-                        return self._json(500, {"error":
-                            "Tuned CV failed the no-invention verifier twice:\n- "
-                            + "\n- ".join(violations)})
-                doc["_jd_chars"] = len(jd)
-
-                os.makedirs(WORK_DIR, exist_ok=True)
-                with open(os.path.join(WORK_DIR, "preview.html"), "w", encoding="utf-8") as f:
-                    f.write(render_html(doc))
-
-                notes = doc.get("tuning_notes", {})
-                base = folder_name(notes.get("company", ""), notes.get("job_title", ""))
-                p, pages, fit, fitted = build_pdf(doc, base, budget)
-                if pages > budget:
-                    # never ship an overflowing CV: one trim pass, model cuts
-                    # the least valuable content, then re-render
-                    try:
-                        trimmed = tune("", budget, b.get("model") or None,
-                            note=("The CV below overflows a %d-page budget even at "
-                                  "minimum type size. Return the same JSON with the "
-                                  "least valuable content removed until it plausibly "
-                                  "fits. Cut whole bullets or skills, never facts "
-                                  "inside a sentence.\n\n<CURRENT_CV_JSON>\n%s\n"
-                                  "</CURRENT_CV_JSON>") % (budget, json.dumps(doc)))
-                        if not verify_doc(trimmed):
-                            p2, pg2, fit2, fitted2 = build_pdf(trimmed, base, budget)
-                            if pg2 <= budget:
-                                doc, p, pages, fit, fitted = trimmed, p2, pg2, fit2, fitted2
-                    except Exception:
-                        pass  # keep the overflowing original; flag stays loud
-
-                notes = doc.get("tuning_notes", {})
-                # the four facts the read pulled off the advert, carried through so the
-                # history row can still answer "what did that one pay?" months later
-                facts = b.get("facts") or {}
-                log_run({
-                    "at": datetime.now().isoformat(timespec="minutes"),
-                    "company": notes.get("company", ""),
-                    "role": notes.get("job_title", ""),
-                    "seniority": notes.get("seniority", ""),
-                    "salary": str(facts.get("salary") or ""),
-                    "remote": str(facts.get("remote") or ""),
-                    "country": str(facts.get("country") or ""),
-                    "portugal": str(facts.get("portugal") or ""),
-                    "europe": str(facts.get("europe") or ""),
-                    "years": str(facts.get("years_experience") or ""),
-                    "pages": pages,
-                    "budget": budget,
-                    "fit": fit,
-                    "overflow": pages > budget,
-                    "unmet": len(notes.get("unmet_requirements") or []),
-                    "jd_chars": len(jd),
-                    "folder": os.path.dirname(p),
-                    "path": p,
-                    "url": "/output/" + quote(os.path.relpath(p, OUT_DIR)),
-                })
-
-                return self._json(200, {
-                    "tcv": doc,
-                    "preview": "/preview.html",
-                    "url": "/output/" + quote(os.path.relpath(p, OUT_DIR)),
-                    "path": p,
-                    "folder": os.path.dirname(p),
-                    "filename": os.path.basename(p),
-                    "bytes": os.path.getsize(p),
-                    "pages": pages,
-                    "budget": budget,
-                    "fit": fit,
-                    "fitted": fitted,
-                    "overflow": pages > budget,
-                })
+                return self._json(200, create_flow(jd, budget, model, facts))
 
             if path == "/api/run-radar":
                 # On-demand full radar pass: scrape, then the morning runner
@@ -1081,28 +1708,6 @@ class Handler(BaseHTTPRequestHandler):
                 subprocess.run(["open", "-R", target], check=False)
                 return self._json(200, {"ok": True})
 
-            if path == "/api/tune":
-                jd = (b.get("jd") or "").strip()
-                url = (b.get("url") or "").strip()
-                if url and not jd:
-                    jd = fetch_jd(url)
-                if len(jd) < 120:
-                    return self._json(400, {"error": "Job description is too short to tune against."})
-                pages = 2 if str(b.get("pages")) == "2" else 1
-                d = tune(jd, pages, b.get("model") or None)
-                violations = verify_doc(d)
-                if violations:
-                    d = tune(jd, pages, b.get("model") or None,
-                             note="Your previous CV was rejected by the fact "
-                                  "verifier. Violations:\n- " + "\n- ".join(violations))
-                    violations = verify_doc(d)
-                    if violations:
-                        return self._json(500, {"error":
-                            "Tuned CV failed the no-invention verifier twice:\n- "
-                            + "\n- ".join(violations)})
-                d["_jd_chars"] = len(jd)
-                return self._json(200, d)
-
             if path == "/api/key":
                 # Written by the user, in their own local app, to their own disk.
                 k = (b.get("key") or "").strip()
@@ -1127,7 +1732,6 @@ class Handler(BaseHTTPRequestHandler):
                 notes = doc.get("tuning_notes", {})
                 company = (b.get("company") or notes.get("company") or "").strip()
                 role = (b.get("label") or notes.get("job_title") or "").strip()
-                # folder reads "finom-senior-product-designer-2026-08-22"
                 base = folder_name(company, role)
                 budget = int(b.get("pages") or 1)
                 p, pages, fit, fitted = build_pdf(doc, base, budget)
@@ -1160,9 +1764,11 @@ def main():
     print("  " + "-" * 46)
     print(f"  master_cv.md   {len(read('master_cv.md')):,} bytes")
     if have_cli():
-        print(f"  Tuning         Claude Code CLI — runs on your subscription")
+        auth = "long-lived token" if oauth_token() else "interactive login"
+        print(f"  Tuning         Claude Code CLI — subscription, via {auth}")
     else:
         print(f"  Tuning         Anthropic API {'(key found)' if api_key() else '— NO KEY, see README'}")
+    print(f"  Baseline       {'baseline_cv.txt found — coverage deltas on' if baseline_text() else 'no baseline_cv.txt — coverage deltas off'}")
     print(f"  Chrome         {find_chrome() or 'NOT FOUND — see README'}")
     print(f"  Output         {OUT_DIR}")
     print(f"\n  →  http://localhost:{PORT}\n")

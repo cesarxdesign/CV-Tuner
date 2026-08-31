@@ -26,9 +26,6 @@
 
 :root {
   --fit: __FIT__;
-  /* vertical justify: spreads the gaps between sections/roles to fill the
-     page after the font fit is chosen. 1 = no spreading. */
-  --vj: __VJUST__;
   /* page margins shrink more slowly than type */
   --pad: calc(0.80 + 0.20 * var(--fit));
 }
@@ -69,8 +66,8 @@ a { color: inherit; text-decoration: none; }
 /* ---------- sections ---------- */
 section {
   border-top: 1px solid #d4d4d4;
-  margin-top: calc(13px * var(--fit) * var(--vj));
-  padding-top: calc(9px * var(--fit) * var(--vj));
+  margin-top: calc(13px * var(--fit));
+  padding-top: calc(9px * var(--fit));
 }
 
 .lbl {
@@ -96,7 +93,7 @@ p { margin: 0; text-align: justify; }
 .skill .v { flex: 1; }
 
 /* ---------- experience ---------- */
-.role { margin-bottom: calc(9px * var(--fit) * var(--vj)); page-break-inside: avoid; }
+.role { margin-bottom: calc(9px * var(--fit)); page-break-inside: avoid; }
 .role:last-child { margin-bottom: 0; }
 .role h3 {
   font-size: calc(11px * var(--fit));

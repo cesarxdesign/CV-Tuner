@@ -78,7 +78,7 @@
   .seg button.on{background:var(--accent); color:var(--onaccent); font-weight:650}
   .bar{display:flex; gap:10px; align-items:center; padding:12px 20px; border-top:1px solid var(--line)}
   .bar .sp{flex:1}
-  .msg{font-size:12.5px; padding:10px 12px; border-radius:7px; margin-top:14px; display:none; line-height:1.5}
+  .msg{font-size:12.5px; padding:10px 12px; border-radius:7px; margin-top:14px; display:none; line-height:1.5; white-space:pre-line}
   .msg.err{display:block; background:var(--errbg); border:1px solid var(--errline); color:var(--errfg)}
   .msg.info{display:block; background:var(--infobg); border:1px solid var(--infoline); color:var(--infofg)}
   .jdwrap{position:relative}
@@ -207,7 +207,7 @@
     <div class="jdwrap" id="jdwrap">
       <textarea id="jd" placeholder="Paste the advert, or a link to it. Reading starts on its own.
 
-A link on its own gets fetched. Anything longer is treated as the advert itself. LinkedIn, Indeed and Glassdoor block fetching, so paste the text for those.
+A link on its own gets fetched: structured ATS data first, then a plain fetch, then Chrome rendering the page, then Claude fetching it. If all four fail you'll be told exactly why; paste the text then.
 
 Cmd-V works anywhere on this page."></textarea>
       <div class="clear" id="clear" title="Clear and start over"><div class="x">&times;</div></div>
@@ -320,7 +320,7 @@ $('pages').onclick = async e => {
   finally { showPhase(false); }
 };
 
-const NEEDS_API = 5;
+const NEEDS_API = 6;
 function paintHealth(d) {
   if ((d.api || 0) < NEEDS_API) {
     msg('This page is newer than the running server. Quit TCV (close its Terminal window) and open it again.', 'err');
@@ -366,33 +366,18 @@ async function post(path, body) {
   return d;
 }
 
-let ticker = null;
-function startTicker() {
-  const t0 = Date.now();
-  const tick = () => {
-    const s = Math.round((Date.now() - t0) / 1000);
-    const mm = Math.floor(s / 60), ss = String(s % 60).padStart(2, '0');
-    showPhase(true, `Writing your CV against this advert… ${mm}:${ss}`);
-    msg(s < 150
-      ? 'Weighing every role in the master CV against the advert, then printing the PDF. Usually about two minutes.'
-      : `Still going at ${mm}:${ss}. Longer than usual. If it passes 4 minutes, check the Terminal window for an error.`,
-      'info');
-  };
-  tick();
-  ticker = setInterval(tick, 1000);
-}
-function stopTicker() { if (ticker) clearInterval(ticker); ticker = null; }
-
 let LAST = null;   // the last created PDF, for Show in Finder
 
 function report(d) {
-  const pct = Math.round(d.fit * 100);
   const where = (d.folder || '').replace(/^\/Users\/[^/]+/, '~');
+  const cov = d.coverage || {};
   msg('Saved to  ' + where + '/' + d.filename +
       '  ·  ' + d.pages + ' page' + (d.pages === 1 ? '' : 's') +
+      (d.filled ? '  ·  page ' + Math.round(d.filled * 100) + '% full' : '') +
+      (cov.total ? '  ·  ATS terms ' + cov.tuned + '/' + cov.total +
+        (cov.baseline != null ? ' (baseline ' + cov.baseline + '/' + cov.total + ')' : '') : '') +
       '  ·  ' + (d.bytes/1024).toFixed(0) + ' kb' +
-      (d.fitted && !d.overflow ? '  ·  scaled to ' + pct + '% to hold ' + d.budget + ' page' + (d.budget === 1 ? '' : 's') : '') +
-      (d.overflow ? '   ⚠ still over at ' + pct + '%, the type floor is reached. Cut a bullet via JSON, or switch to ' + d.pages + ' pages.' : ''),
+      (d.overflow ? '   ⚠ over the page budget even after compression. Cut a bullet via JSON, or switch to 2 pages.' : ''),
       d.overflow ? 'err' : 'info');
 }
 
@@ -422,7 +407,9 @@ function renderHistory(items) {
         : it.portugal === 'No' ? `<span class="tag bad">Not Portugal${it.country ? ' · ' + esc(it.country) : ''}</span>`
         : (it.country ? `<span class="tag">${esc(it.country)}</span>` : ''),
       `<span class="tag">${it.pages} page${it.pages === 1 ? '' : 's'}</span>`,
-      pct < 100 ? `<span class="tag">${pct}%</span>` : '',
+      it.cov ? `<span class="tag good">${esc(it.cov)} terms${it.cov_base ? ' · was ' + esc(it.cov_base) : ''}</span>` : '',
+      it.filled ? `<span class="tag">${Math.round(it.filled * 100)}% full</span>` : '',
+      !it.cov && pct < 100 ? `<span class="tag">${pct}%</span>` : '',
       it.overflow ? `<span class="tag warn">over budget</span>` : '',
       it.unmet ? `<span class="tag warn">${it.unmet} unmet</span>` : `<span class="tag good">no blockers</span>`
     ].filter(Boolean).join('');
@@ -562,15 +549,34 @@ async function runCreate() {
   CREATING = true;
   hideButton();
   clearMsg(); $('notes').style.display = 'none';
-  startTicker();
+  const t0 = Date.now();
   try {
     const body = PARSED ? { jd: PARSED, pages } : { input: raw, pages };
     if (FACTS) body.facts = FACTS;
-    const d = await post('/api/create', body);
-    stopTicker();
+    body.async = true;
+    // The pipeline runs as a background job on the server: many model passes,
+    // real renders in between. The browser just watches the log.
+    const start = await post('/api/create', body);
+    let d = null;
+    for (;;) {
+      await new Promise(r => setTimeout(r, 2500));
+      let j;
+      try { j = await (await fetch('/api/job?id=' + start.job)).json(); }
+      catch (e) { continue; }   // one dropped poll never kills a 15-minute run
+      if (j.error && !j.status) throw new Error(j.error);
+      const s = Math.round((Date.now() - t0) / 1000);
+      const mm = Math.floor(s / 60), ss = String(s % 60).padStart(2, '0');
+      const log = j.log || [];
+      const lastLine = log.length ? log[log.length - 1].replace(/^\d\d:\d\d:\d\d /, '') : 'starting…';
+      showPhase(true, `${lastLine}  ·  ${mm}:${ss}`);
+      msg('Read the JD → write every role in full → audit keyword coverage → audit every claim against the master → compress and expand content until the page is exactly full. Quality-first: expect 10–20 minutes.\n\n'
+          + log.slice(-7).map(l => l.replace(/^\d\d:\d\d:\d\d /, '· ')).join('\n'), 'info');
+      if (j.status === 'done') { d = j.result; break; }
+      if (j.status === 'error') throw new Error(j.error || 'tuning failed');
+    }
     TCV = d.tcv;
     LAST = d;
-    renderNotes(TCV);
+    renderNotes(TCV, d);
     loadHistory();
     $('reveal').disabled = false; $('edit').disabled = false;
     lockInput();
@@ -579,7 +585,6 @@ async function runCreate() {
     msg(e.message, 'err');
     offerButton('Try again', runCreate);
   } finally {
-    stopTicker();
     showPhase(false);
     CREATING = false;
   }
@@ -614,12 +619,23 @@ function chips(arr, cls) {
 }
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-function renderNotes(d) {
+function renderNotes(d, resp) {
   const n = d.tuning_notes || {};
+  const cov = (resp && resp.coverage) || (LAST && LAST.coverage) || null;
   let h = '';
   h += `<h3>Read of the role</h3><p>${esc(n.job_title||'—')} · ${esc(n.seniority||'—')}</p>`;
   h += `<h3>Led with</h3><p>${esc(n.led_with||'—')}</p>`;
-  if ((n.matched_terms||[]).length) h += `<h3>Matched terms (${n.matched_terms.length})</h3>` + chips(n.matched_terms, 'm');
+  if (cov && cov.total) {
+    h += `<h3>ATS coverage: ${cov.tuned}/${cov.total} JD terms, verbatim`
+       + (cov.baseline != null ? ` · baseline CV ${cov.baseline}/${cov.total}` : '') + `</h3>`
+       + chips(cov.matched, 'm');
+    if ((cov.missing_claimable||[]).length)
+      h += `<h3 class="flag">Claimable but not on the CV</h3>` + chips(cov.missing_claimable);
+    if ((cov.missing_unclaimable||[]).length)
+      h += `<h3 class="flag">JD terms Cesar can't claim (never faked)</h3>` + chips(cov.missing_unclaimable);
+  } else if ((n.matched_terms||[]).length) {
+    h += `<h3>Matched terms (${n.matched_terms.length})</h3>` + chips(n.matched_terms, 'm');
+  }
   if ((n.compressed_or_cut||[]).length)
     h += `<h3>Compressed or cut</h3><ul class="tight">` +
          n.compressed_or_cut.map(x=>`<li>${esc(x)}</li>`).join('') + `</ul>`;
